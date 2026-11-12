@@ -15,7 +15,13 @@ const environmentSchema = databaseSchema.extend({
     .min(1)
     .pipe(z.coerce.number<string>().int().min(0).max(65535))
     .default(3000),
-  LANGSMITH_TRACING: z.literal('false').default('false'),
+  MODEL_CREDENTIALS_KEY: z
+    .string()
+    .regex(/^[a-fA-F0-9]{64}$/)
+    .optional(),
+  AGENT_MODEL_CALL_LIMIT: z.coerce.number().int().min(1).max(100).default(10),
+  AGENT_TOOL_CALL_LIMIT: z.coerce.number().int().min(1).max(100).default(20),
+  AGENT_TIMEOUT_MS: z.coerce.number().int().min(1).max(3600000).default(120000),
   AUTH_JWT_SECRET: z.string().min(32).regex(/\S/),
 });
 

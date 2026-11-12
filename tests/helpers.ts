@@ -1,4 +1,8 @@
-import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import {
+  BaseChatModel,
+  type BaseChatModelCallOptions,
+  type BindToolsInput,
+} from '@langchain/core/language_models/chat_models';
 import {
   AIMessage,
   AIMessageChunk,
@@ -9,8 +13,15 @@ import { ChatGenerationChunk, type ChatResult } from '@langchain/core/outputs';
 // A small scripted model shared by all SDK tests, not a production model option.
 export class ScriptedModel extends BaseChatModel {
   readonly seen: BaseMessage[][] = [];
+  readonly boundTools: BindToolsInput[][] = [];
 
-  constructor(private readonly responses: (AIMessage | Error)[]) {
+  constructor(
+    private readonly responses: (
+      | AIMessage
+      | Error
+      | ((options: BaseChatModelCallOptions) => Promise<AIMessage>)
+    )[],
+  ) {
     super({ maxRetries: 0 });
   }
 
@@ -18,20 +29,29 @@ export class ScriptedModel extends BaseChatModel {
     return 'scripted-test';
   }
 
-  bindTools() {
+  bindTools(tools: BindToolsInput[]) {
+    this.boundTools.push(tools);
     return this;
   }
 
-  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+  async _generate(
+    messages: BaseMessage[],
+    options: BaseChatModelCallOptions = {},
+  ): Promise<ChatResult> {
     this.seen.push([...messages]);
-    const response = this.responses.shift();
+    const scripted = this.responses.shift();
+    const response =
+      typeof scripted === 'function' ? await scripted(options) : scripted;
     if (!response) throw new Error('Unexpected model call: script exhausted');
     if (response instanceof Error) throw response;
     return { generations: [{ message: response, text: response.text }] };
   }
 
-  async *_streamResponseChunks(messages: BaseMessage[]) {
-    const result = await this._generate(messages);
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: BaseChatModelCallOptions,
+  ) {
+    const result = await this._generate(messages, options);
     const message = result.generations[0].message as AIMessage;
     yield new ChatGenerationChunk({
       message: new AIMessageChunk({

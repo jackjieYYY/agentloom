@@ -13,7 +13,6 @@ export function jwtFixture(
     sign: (claims: JWTPayload = {}) =>
       new SignJWT({
         exp: Math.floor(Date.now() / 1000) + 300,
-        tenant_id: 'tenant-a',
         sub: 'user-a',
         ...claims,
       })

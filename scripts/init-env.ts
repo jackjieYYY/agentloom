@@ -13,14 +13,6 @@ try {
     content = await readFile('.env.example', 'utf8');
   }
   const env = parseEnv(content);
-  if (
-    env.POSTGRES_PASSWORD === 'replace-with-local-password' ||
-    env.DATABASE_URL?.includes('replace-with-local-password')
-  ) {
-    throw new Error(
-      'Replace existing placeholder credentials before proceeding.',
-    );
-  }
   const credentials: Record<string, string> = {};
   if (!env.DATABASE_URL) {
     if (env.POSTGRES_PASSWORD) {
@@ -34,6 +26,9 @@ try {
   }
   if (!env.AUTH_JWT_SECRET) {
     credentials.AUTH_JWT_SECRET = randomBytes(32).toString('hex');
+  }
+  if (!env.MODEL_CREDENTIALS_KEY) {
+    credentials.MODEL_CREDENTIALS_KEY = randomBytes(32).toString('hex');
   }
   if (Object.keys(credentials).length > 0) {
     for (const [key, value] of Object.entries(credentials)) {

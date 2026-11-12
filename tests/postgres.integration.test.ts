@@ -7,12 +7,12 @@ import { AIMessage } from '@langchain/core/messages';
 import { createDeepAgent } from 'deepagents';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createDatabase, type Database } from '../src/database/client.js';
-import { migrateDatabase } from '../src/database/migrate.js';
-import { createApp } from '../src/app.js';
+import { initializeDatabase } from '../src/database/initialize.js';
+import { createApp } from './app.js';
 import { ScriptedModel } from './helpers.js';
 import { parseConfig } from '../src/config/env.js';
-import { conversations } from '../src/database/schema.js';
-import { eq } from 'drizzle-orm';
+import { conversations, modelProviders } from '../src/database/schema.js';
+import { eq, sql } from 'drizzle-orm';
 import { authEnv, jwtFixture } from './auth-helpers.js';
 
 // Deliberately separate from DATABASE_URL: never silently target a production DB.
@@ -32,10 +32,16 @@ afterEach(async () => {
   await Promise.all(databases.splice(0).map((db) => db.close()));
 });
 
-it('migrates an empty database, shares one pool, and reloads SDK state across pools and repeated setup', async () => {
+it('shares one pool and reloads SDK state across pools without reinitializing', async () => {
+  await initializeDatabase(url!);
   const first = database();
-  await migrateDatabase(first);
   expect(first.db.$client).toBe(first.pool);
+  await first.db.execute(
+    sql`CREATE TABLE unmanaged_initialization_fixture (value text NOT NULL)`,
+  );
+  await first.db.execute(
+    sql`INSERT INTO unmanaged_initialization_fixture VALUES ('preserved')`,
+  );
   const config = { configurable: { thread_id: `step2-${randomUUID()}` } };
   const agent = createDeepAgent({
     model: new ScriptedModel([new AIMessage('saved response')]),
@@ -49,8 +55,14 @@ it('migrates an empty database, shares one pool, and reloads SDK state across po
   await Promise.all([first.close(), first.close()]);
   expect(end).toHaveBeenCalledTimes(1);
   const second = database();
-  await migrateDatabase(second);
-  await migrateDatabase(second);
+  expect(
+    (
+      await second.db.execute(
+        sql`SELECT value FROM unmanaged_initialization_fixture`,
+      )
+    ).rows,
+  ).toEqual([{ value: 'preserved' }]);
+  await second.db.execute(sql`DROP TABLE unmanaged_initialization_fixture`);
   const model = new ScriptedModel([]);
   const recreated = createDeepAgent({ model, checkpointer: second.saver });
   const state = await recreated.graph.getState(config);
@@ -59,6 +71,55 @@ it('migrates an empty database, shares one pool, and reloads SDK state across po
   expect(model.seen).toHaveLength(0);
   // Saver work used this pool rather than a hidden independent connection pool.
   expect(second.pool.totalCount).toBeGreaterThan(0);
+});
+
+it('recreates the whole database and removes business data, checkpoints and unmanaged objects', async () => {
+  await initializeDatabase(url!);
+  const db = database();
+  const id = randomUUID();
+  await db.db.insert(modelProviders).values({
+    id,
+    name: 'Schema safety fixture',
+    type: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKeyEncrypted: 'test-fixture',
+  });
+  await db.pool.query(`
+    CREATE TYPE unmanaged_enum AS ENUM ('old');
+    CREATE SEQUENCE unmanaged_sequence;
+    CREATE SCHEMA unmanaged;
+    CREATE TABLE unmanaged.fixture (value unmanaged_enum);
+  `);
+  const config = { configurable: { thread_id: randomUUID() } };
+  const agent = createDeepAgent({
+    model: new ScriptedModel([new AIMessage('old checkpoint')]),
+    checkpointer: db.saver,
+  });
+  await agent.invoke({ messages: [{ role: 'user', content: 'old' }] }, config);
+  await db.close();
+
+  await initializeDatabase(url!);
+  const fresh = database();
+  expect(await fresh.db.select().from(modelProviders)).toEqual([]);
+  expect(await fresh.saver.getTuple(config)).toBeUndefined();
+  expect(
+    (
+      await fresh.pool.query(`
+    SELECT to_regtype('unmanaged_enum') AS enum,
+           to_regclass('unmanaged_sequence') AS sequence,
+           to_regnamespace('unmanaged') AS schema
+  `)
+    ).rows,
+  ).toEqual([{ enum: null, sequence: null, schema: null }]);
+});
+
+it('requires an explicit database name before connecting', async () => {
+  const target = new URL(url!);
+  target.pathname = '/';
+  target.searchParams.delete('database');
+  await expect(initializeDatabase(target.href)).rejects.toThrow(
+    'requires an explicit database name',
+  );
 });
 
 it('checks real readiness and reports unavailable PostgreSQL without leaking details', async () => {
@@ -97,9 +158,9 @@ it('checks real readiness and reports unavailable PostgreSQL without leaking det
   }
 });
 
-it('creates owned conversations and denies other tenants, users and guessed IDs', async () => {
+it('creates owned conversations and denies other users and guessed IDs', async () => {
+  await initializeDatabase(url!);
   const db = database();
-  await migrateDatabase(db);
   const fixture = jwtFixture();
   const app = createApp(
     db,
@@ -113,7 +174,6 @@ it('creates owned conversations and denies other tenants, users and guessed IDs'
       url: '/conversations',
       headers: {
         authorization,
-        'x-tenant-id': 'forged',
         'x-user-id': 'forged',
       },
       payload: {},
@@ -131,24 +191,24 @@ it('creates owned conversations and denies other tenants, users and guessed IDs'
       .select()
       .from(conversations)
       .where(eq(conversations.id, conversationId!));
-    expect(stored).toMatchObject({ tenantId: 'tenant-a', userId: 'user-a' });
+    expect(stored).toMatchObject({ userId: 'user-a' });
     const owned = await app.inject({
       url: `/conversations/${conversationId}`,
       headers: { authorization },
     });
     expect(owned.statusCode).toBe(200);
-    expect(owned.json()).toEqual(conversation);
+    expect(owned.json()).toMatchObject({
+      ...conversation,
+      messages: [],
+      closedAt: null,
+      active: false,
+    });
 
-    for (const claims of [
-      { tenant_id: 'tenant-b' },
-      { sub: 'user-b' },
-      { tenant_id: 'tenant-b', sub: 'user-b' },
-    ]) {
+    for (const claims of [{ sub: 'user-b' }]) {
       const denied = await app.inject({
-        url: `/conversations/${conversationId}?tenantId=tenant-a&userId=user-a&thread_id=${conversationId}`,
+        url: `/conversations/${conversationId}?userId=user-a&thread_id=${conversationId}`,
         headers: {
           authorization: `Bearer ${await fixture.sign(claims)}`,
-          'x-tenant-id': 'tenant-a',
           'x-user-id': 'user-a',
         },
       });
@@ -179,8 +239,8 @@ it('creates owned conversations and denies other tenants, users and guessed IDs'
 });
 
 it('runs compiled ESM, preserves conversations across restarts and exits on SIGTERM within a bound', async () => {
+  await initializeDatabase(url!);
   const db = database();
-  await migrateDatabase(db);
   const fixture = jwtFixture();
   const authorization = `Bearer ${await fixture.sign()}`;
   let conversation: { conversationId: string; createdAt: string } | undefined;
@@ -194,7 +254,6 @@ it('runs compiled ESM, preserves conversations across restarts and exits on SIGT
           DATABASE_URL: url!,
           HOST: '127.0.0.1',
           PORT: '0',
-          LANGSMITH_TRACING: 'false',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -231,7 +290,12 @@ it('runs compiled ESM, preserves conversations across restarts and exits on SIGT
           { headers: { authorization } },
         );
         expect(queried.status).toBe(200);
-        expect(await queried.json()).toEqual(conversation);
+        expect(await queried.json()).toMatchObject({
+          ...conversation,
+          messages: [],
+          closedAt: null,
+          active: false,
+        });
         const started = Date.now();
         child.kill('SIGTERM');
         const [code, signal] = await exited;
