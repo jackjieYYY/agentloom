@@ -1,14 +1,17 @@
 import 'tsx';
-import { AIMessage, type BaseMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  isToolMessage,
+  type BaseMessage,
+} from '@langchain/core/messages';
 import type { BaseChatModelCallOptions } from '@langchain/core/language_models/chat_models';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
-import { interrupt } from '@langchain/langgraph';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createApp } from './app.js';
 import { parseConfig } from '../src/config/env.js';
 import { createDatabase } from '../src/database/client.js';
 import { initializeDatabase } from '../src/database/initialize.js';
-import { modelConfigs } from '../src/database/schema.js';
+import { approvalAudits, modelConfigs } from '../src/database/schema.js';
 import { createExecution } from '../src/runtime/execution.js';
 import { createProvider, createModel } from '../src/models/manage.js';
 import { jwtFixture } from './auth-helpers.js';
@@ -102,7 +105,9 @@ function gate() {
 
 it('streams tools, messages and completion, retains history and isolates conversations', async () => {
   const model = new ScriptedModel([
-    callTool('echo', { text: 'safe echo' }),
+    callTool('write_todos', {
+      todos: [{ content: 'safe task', status: 'completed' }],
+    }),
     new AIMessage({
       content: [
         { type: 'reasoning', reasoning: 'private reasoning' },
@@ -168,7 +173,7 @@ it('streams tools, messages and completion, retains history and isolates convers
 it('authorizes every execution, read and cancel operation and validates request bodies', async () => {
   const model = new ScriptedModel([]);
   const f = await setup(model);
-  for (const action of ['', '/input', '/continue', '/cancel']) {
+  for (const action of ['', '/input', '/continue', '/cancel', '/approvals']) {
     for (const claims of [undefined, { sub: 'other' }]) {
       const response = await f.app.inject({
         method: action ? 'POST' : 'GET',
@@ -178,7 +183,14 @@ it('authorizes every execution, read and cancel operation and validates request 
           : {},
         ...(action === '/input'
           ? { payload: { text: 'private', modelConfigId: f.modelConfigId } }
-          : {}),
+          : action === '/approvals'
+            ? {
+                payload: {
+                  interruptId: 'unknown',
+                  decisions: [{ type: 'approve' }],
+                },
+              }
+            : {}),
       });
       expect(response.statusCode).toBe(claims ? 404 : 401);
     }
@@ -197,6 +209,28 @@ it('authorizes every execution, read and cancel operation and validates request 
   }
   for (const action of ['continue', 'cancel'])
     expect((await f.post(action, { text: 'forged' })).statusCode).toBe(400);
+  for (const payload of [
+    {},
+    { interruptId: '', decisions: [{ type: 'approve' }] },
+    { interruptId: 'unknown', decisions: [] },
+    { interruptId: 'unknown', decisions: [{ type: 'edit' }] },
+    { interruptId: 'unknown', decisions: [{ type: 'respond' }] },
+    {
+      interruptId: 'unknown',
+      decisions: [{ type: 'reject', message: 'extra' }],
+    },
+    {
+      interruptId: 'unknown',
+      decisions: [{ type: 'approve' }],
+      userId: 'forged',
+    },
+    {
+      interruptId: 'unknown',
+      decisions: [{ type: 'approve' }],
+      modelConfigId: f.modelConfigId,
+    },
+  ])
+    expect((await f.post('approvals', payload)).statusCode).toBe(400);
   expect(
     (
       await f.app.inject({
@@ -276,10 +310,10 @@ it.each(['model', 'tool'])(
   async (kind) => {
     const model = new ScriptedModel(
       kind === 'model'
-        ? [callTool('echo', { text: 'one' }), new AIMessage('finished')]
+        ? [callTool('write_todos', { todos: [] }), new AIMessage('finished')]
         : [
-            callTool('echo', { text: 'one' }),
-            callTool('echo', { text: 'two' }, 'call-2'),
+            callTool('write_todos', { todos: [] }),
+            callTool('write_todos', { todos: [] }, 'call-2'),
             new AIMessage('finished'),
           ],
     );
@@ -608,24 +642,47 @@ it('waits for in-flight admission during shutdown and never starts its agent', a
   }
 });
 
-it('blocks input and ordinary continuation for saved approval interrupts without an approval endpoint', async () => {
-  const f = await setup(
-    new ScriptedModel([
-      async () => {
-        interrupt({ reason: 'test-only pending approval' });
-        return new AIMessage('never');
-      },
-    ]),
-  );
+it('persists pending approvals, blocks bypasses and resumes with fresh limits after restart', async () => {
+  const text = `${'visible '.repeat(30)}private-tail`;
+  const model = new ScriptedModel([callTool('echo', { text })]);
+  const f = await setup(model, {
+    AGENT_MODEL_CALL_LIMIT: '1',
+    AGENT_TOOL_CALL_LIMIT: '1',
+    AGENT_TIMEOUT_MS: '1000',
+  });
   const response = await f.post('input', { text: 'approval' });
   expect(response.body).toContain('event: awaiting_approval');
-  expect(response.body).not.toContain('test-only pending approval');
-  expect((await f.query()).json()).toMatchObject({
+  expect(response.body).not.toContain('"status":"finished"');
+  expect(response.body).not.toContain('private-tail');
+  expect(model.seen).toHaveLength(1);
+  const pending = (await f.query()).json();
+  expect(pending).toMatchObject({
     awaitingApproval: true,
     canSubmit: false,
     canContinue: false,
+    canApprove: true,
     active: false,
+    closedAt: null,
+    approvalAudit: [],
+    approvals: [
+      {
+        interruptId: expect.any(String),
+        decisionStatus: 'pending',
+        actions: [
+          {
+            toolName: 'echo',
+            argumentSummary: text.slice(0, 200),
+            allowedDecisions: ['approve', 'reject'],
+          },
+        ],
+      },
+    ],
   });
+  const decision = {
+    interruptId: pending.approvals[0].interruptId,
+    decisions: [{ type: 'approve' }],
+  };
+  expect(response.body).toContain(decision.interruptId);
   for (const action of ['input', 'continue'])
     expect(
       (
@@ -635,8 +692,279 @@ it('blocks input and ordinary continuation for saved approval interrupts without
         )
       ).json().error,
     ).toBe('Approval required');
-  expect((await f.post('approve')).statusCode).toBe(404);
+  expect(
+    (await f.post('approvals', { ...decision, interruptId: 'stale' }))
+      .statusCode,
+  ).toBe(409);
+  expect(
+    (
+      await f.post('approvals', {
+        ...decision,
+        decisions: [{ type: 'approve' }, { type: 'reject' }],
+      })
+    ).statusCode,
+  ).toBe(400);
+  expect(await f.database.db.select().from(approvalAudits)).toEqual([]);
+
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  await vi.advanceTimersByTimeAsync(10000);
+  expect((await f.query()).json()).toMatchObject({
+    active: false,
+    closedAt: null,
+    canApprove: true,
+  });
+  vi.useRealTimers();
+  await f.app.close();
+  const resumedModel = new ScriptedModel([new AIMessage('approved answer')]);
+  const database = createDatabase(url!);
+  const app = createApp(database, f.config, resumedModel);
+  apps.push(app);
+  expect(
+    (await app.inject({ url: f.path, headers: f.headers })).json().approvals,
+  ).toEqual(pending.approvals);
+  expect(resumedModel.seen).toHaveLength(0);
+  const approve = (payload = decision) =>
+    app.inject({
+      method: 'POST',
+      url: `${f.path}/approvals`,
+      headers: f.headers,
+      payload,
+    });
+  const resumed = await approve();
+  expect(resumed.headers['content-type']).toContain('text/event-stream');
+  expect(resumed.body).toContain('approved answer');
+  expect(resumed.body).toContain('"status":"finished"');
+  expect(resumed.body).toContain('event: completed');
+  expect(resumed.body).toContain('"status":"completed"');
+  expect(resumedModel.seen).toHaveLength(1);
+  expect(
+    resumedModel.seen[0].filter(isToolMessage).map((message) => message.text),
+  ).toEqual([text]);
+  for (const type of ['approve', 'reject'])
+    expect(
+      (await approve({ ...decision, decisions: [{ type }] })).statusCode,
+    ).toBe(409);
+  const saved = (await app.inject({ url: f.path, headers: f.headers })).json();
+  expect(saved).toMatchObject({
+    approvals: [],
+    awaitingApproval: false,
+    canApprove: false,
+    active: false,
+    canSubmit: true,
+    approvalAudit: [
+      {
+        interruptId: decision.interruptId,
+        decisions: decision.decisions,
+        userId: 'user-a',
+        createdAt: expect.any(String),
+      },
+    ],
+  });
+  expect(await database.db.select().from(approvalAudits)).toHaveLength(1);
 });
+
+it('matches batched decisions by position and requires a new approval for a rejected tool request', async () => {
+  const model = new ScriptedModel([
+    new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          name: 'echo',
+          args: { text: 'approved-text' },
+          id: 'approved-call',
+          type: 'tool_call',
+        },
+        {
+          name: 'echo',
+          args: { text: 'rejected-text' },
+          id: 'rejected-call',
+          type: 'tool_call',
+        },
+      ],
+    }),
+    callTool('echo', { text: 'rejected-text' }, 'new-call'),
+    new AIMessage('rejection acknowledged'),
+  ]);
+  const f = await setup(model);
+  await f.post('input', { text: 'batch' });
+  const first = (await f.query()).json().approvals[0];
+  expect(first.actions).toHaveLength(2);
+  const resumed = await f.post('approvals', {
+    interruptId: first.interruptId,
+    decisions: [{ type: 'approve' }, { type: 'reject' }],
+  });
+  expect(resumed.body).toContain('event: awaiting_approval');
+  const toolResults = model.seen[1].filter(isToolMessage);
+  expect(toolResults).toHaveLength(2);
+  expect(
+    toolResults.find((message) => message.tool_call_id === 'approved-call')
+      ?.text,
+  ).toBe('approved-text');
+  expect(
+    toolResults.find((message) => message.tool_call_id === 'rejected-call'),
+  ).toMatchObject({ status: 'error' });
+  const next = (await f.query()).json().approvals[0];
+  expect(next.interruptId).not.toBe(first.interruptId);
+  expect(next.decisionStatus).toBe('pending');
+  expect((await f.post('continue')).statusCode).toBe(409);
+  const rejected = await f.post('approvals', {
+    interruptId: next.interruptId,
+    decisions: [{ type: 'reject' }],
+  });
+  expect(rejected.body).toContain('rejection acknowledged');
+  expect(rejected.body).toContain('event: completed');
+  expect(
+    model.seen[2]
+      .filter(isToolMessage)
+      .find((message) => message.tool_call_id === 'new-call'),
+  ).toMatchObject({ status: 'error' });
+  expect((await f.query()).json().approvalAudit).toHaveLength(2);
+});
+
+it('never resumes without an audit receipt or resends a recorded decision whose outcome is unconfirmed', async () => {
+  const model = new ScriptedModel([callTool('echo', { text: 'not executed' })]);
+  const f = await setup(model);
+  await f.post('input', { text: 'approval' });
+  const { interruptId } = (await f.query()).json().approvals[0];
+  const decision = { interruptId, decisions: [{ type: 'approve' as const }] };
+  const insert = vi
+    .spyOn(f.database.db, 'insert')
+    .mockImplementationOnce(() => {
+      throw new Error('private-audit-error');
+    });
+  const failed = await f.post('approvals', decision);
+  insert.mockRestore();
+  expect(failed.statusCode).toBe(500);
+  expect(failed.body).not.toContain('private-audit-error');
+  expect((await f.query()).json().canApprove).toBe(true);
+  expect(await f.database.db.select().from(approvalAudits)).toEqual([]);
+  const execution = createExecution(f.database, f.config, model);
+  await expect(
+    execution.execute(f.id, { userId: 'user-a' }, decision, async () => {
+      throw new Error('response setup failed after receipt');
+    }),
+  ).rejects.toThrow('response setup failed after receipt');
+  expect(model.seen).toHaveLength(1);
+  expect((await f.query()).json()).toMatchObject({
+    active: false,
+    awaitingApproval: true,
+    canApprove: false,
+    approvals: [{ interruptId, decisionStatus: 'unconfirmed' }],
+    approvalAudit: [{ interruptId, decisions: decision.decisions }],
+  });
+  // The unique key is the durable guard even across processes.
+  await expect(
+    f.database.db
+      .insert(approvalAudits)
+      .values({ conversationId: f.id, ...decision, userId: 'user-a' }),
+  ).rejects.toThrow();
+  // A later model configuration change cannot turn a recorded decision into a retry.
+  await f.database.db.update(modelConfigs).set({ enabled: false });
+  await f.app.close();
+  const unused = new ScriptedModel([]);
+  const app = createApp(createDatabase(url!), f.config, unused);
+  apps.push(app);
+  for (const type of ['approve', 'reject']) {
+    const repeated = await app.inject({
+      method: 'POST',
+      url: `${f.path}/approvals`,
+      headers: f.headers,
+      payload: { interruptId, decisions: [{ type }] },
+    });
+    expect(repeated.statusCode).toBe(409);
+    expect(repeated.json().error).toBe('Decision outcome unconfirmed');
+  }
+  expect(
+    (await app.inject({ url: f.path, headers: f.headers })).json().approvals[0]
+      .decisionStatus,
+  ).toBe('unconfirmed');
+  expect(unused.seen).toHaveLength(0);
+  await app.inject({
+    method: 'POST',
+    url: `${f.path}/cancel`,
+    headers: f.headers,
+  });
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: `${f.path}/approvals`,
+        headers: f.headers,
+        payload: decision,
+      })
+    ).json().error,
+  ).toBe('Conversation closed');
+});
+
+it.each([true, false])(
+  'serializes approval with cancellation when approval goes first: %s',
+  async (approvalFirst) => {
+    const blocked = gate();
+    const model = new ScriptedModel([
+      callTool('echo', { text: 'review me' }),
+      blocked.response,
+    ]);
+    const f = await setup(model);
+    await f.post('input', { text: 'approval race' });
+    const { interruptId } = (await f.query()).json().approvals[0];
+    const decision = { interruptId, decisions: [{ type: 'approve' }] };
+    const execution = createExecution(f.database, f.config, model);
+    const identity = { userId: 'user-a' };
+    const events: string[] = [];
+    const approve = () =>
+      execution
+        .execute(
+          f.id,
+          identity,
+          {
+            interruptId,
+            decisions: [{ type: 'approve' }],
+          },
+          (call) =>
+            call.stream(async (event, data) => {
+              events.push(`${event}:${JSON.stringify(data)}`);
+            }),
+        )
+        .then(
+          () => 'accepted',
+          (error: Error) => error.message,
+        );
+    // Both operations queue synchronously on the same lock before either DB read finishes.
+    const first = approvalFirst ? approve() : execution.cancel(f.id, identity);
+    const second = approvalFirst ? execution.cancel(f.id, identity) : approve();
+    const canceled = await (approvalFirst ? second : first);
+    expect(canceled).toMatchObject({
+      closedAt: expect.any(Date),
+      active: approvalFirst,
+    });
+    for (const action of ['input', 'continue', 'approvals'])
+      expect(
+        (
+          await f.post(
+            action,
+            action === 'input'
+              ? { text: 'closed' }
+              : action === 'approvals'
+                ? decision
+                : undefined,
+          )
+        ).statusCode,
+      ).toBe(409);
+    blocked.release();
+    const approval = await (approvalFirst ? first : second);
+    expect(approval).toBe(approvalFirst ? 'accepted' : 'Conversation closed');
+    if (approvalFirst) expect(events.join()).toContain('"status":"stopped"');
+    expect(await execution.query(f.id, identity)).toMatchObject({
+      closedAt: expect.any(Date),
+      active: false,
+      canApprove: false,
+    });
+    expect(await f.database.db.select().from(approvalAudits)).toHaveLength(
+      approvalFirst ? 1 : 0,
+    );
+    expect(model.seen.length).toBeLessThanOrEqual(approvalFirst ? 2 : 1);
+  },
+);
 
 it('requires available model configuration even with an injected client', async () => {
   const model = new ScriptedModel([]);

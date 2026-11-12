@@ -13,6 +13,12 @@ const inputBody = z.strictObject({
   text: z.string().trim().min(1).max(32000),
   modelConfigId: z.uuid(),
 });
+const approvalBody = z.strictObject({
+  interruptId: z.string().min(1),
+  decisions: z
+    .array(z.strictObject({ type: z.enum(['approve', 'reject']) }))
+    .min(1),
+});
 const listQuery = z.strictObject({
   cursor: z.uuid().optional(),
   limit: z
@@ -117,6 +123,17 @@ const conversationRoutes: FastifyPluginAsync<ConversationOptions> = async (
     emptyBody.parse(request.body);
     return execution.execute(conversationId, request.identity, null, (call) =>
       stream(request, reply, call),
+    );
+  });
+
+  app.post('/:conversationId/approvals', async (request, reply) => {
+    const conversationId = id(request, reply);
+    const decision = approvalBody.parse(request.body);
+    return execution.execute(
+      conversationId,
+      request.identity,
+      decision,
+      (call) => stream(request, reply, call),
     );
   });
 

@@ -1,7 +1,9 @@
 import {
   boolean,
   index,
+  jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uuid,
@@ -34,6 +36,24 @@ export const modelConfigs = pgTable('model_configs', {
     .defaultNow()
     .notNull(),
 });
+
+export type ApprovalDecision = { type: 'approve' | 'reject' };
+
+export const approvalAudits = pgTable(
+  'approval_audits',
+  {
+    conversationId: uuid('conversation_id').notNull(),
+    interruptId: text('interrupt_id').notNull(),
+    decisions: jsonb('decisions').$type<ApprovalDecision[]>().notNull(),
+    userId: text('user_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.conversationId, table.interruptId] }),
+  ],
+);
 
 export const conversations = pgTable(
   'conversations',

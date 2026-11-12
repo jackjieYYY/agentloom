@@ -38,11 +38,16 @@ SDK 提供 `modelCallLimitMiddleware` 和 `toolCallLimitMiddleware`。当前锁�
 | 查询           | `agent.graph.getState()`，只读取最新保存状态                              |
 | 新输入         | `agent.stream({ messages }, config)`，沿用相同 thread 的历史              |
 | 错误后继续     | `agent.stream(null, config)`，不传历史 checkpoint ID                      |
-| 待审批中断     | 读取 SDK task interrupts；不把普通 continue 当成 `Command({ resume })`    |
+| 待审批中断     | `interruptOn.echo` 仅允许 approve / reject；读取 SDK task interrupts      |
+| 审批恢复       | 校验当前中断并先写审计，再传 `Command({ resume: { decisions } })`         |
 | 流式输出       | SDK `messages` 与 `updates` 流模式，服务端投影成脱敏 SSE                  |
 | 文本与消息类型 | SDK `message.text`、`isHumanMessage`、`isAIMessage`、`isToolMessage`      |
 | 停止           | 向 SDK 传递 `AbortSignal`，等待流、hooks 和模型生命周期结束后释放活跃记录 |
 | 持久性         | 执行设置 `durability: 'sync'`；沿用官方 saver 的初始化与连接池            |
+
+待审批内容仅保存在官方 checkpoint。会话查询与 `awaiting_approval` SSE 只返回中断 ID、工具名、echo 文本的前 200 字符及允许的决策，不返回完整中断、工具参数或图状态。批量决策按 SDK `actionRequests` 的顺序一一对应，拒绝会把拒绝结果交给模型，模型再次请求同一工具时产生新的审批。
+
+`approval_audits` 只保存会话、中断 ID、决策数组、可信 userId 和时间，以会话和中断 ID 为复合主键。准入锁内校验当前中断、写入审计，然后才启动 SDK；这两个持久化操作不构成跨表原子提交。审计只证明已接收决策。若同一中断仍在且已有审计，查询返回 `decisionStatus: unconfirmed`，再次提交返回 409 `Decision outcome unconfirmed`，不自动重发。操作者可以查询，或取消会话后另建会话。
 
 没有自写的消息内容解析器或第二套消息历史。`message.text` 通过 SDK 的标准内容块提取文本，思考块、工具参数和其他内部内容不进入公开文本响应。API 的 SSE 是业务投影，客户端使用 `fetch` 读取；未宣称兼容 Agent Server 的 HTTP 协议或 `useStream`。
 
@@ -54,7 +59,7 @@ LangGraph 的新输入、错误后继续、审批恢复和历史重放语义不�
 
 ## 执行生命周期与停止
 
-执行服务通过 `execute(id, identity, input, consume)` 持有整个执行作用域。新输入为 `{ text, modelConfigId }`，继续执行传 null。归属、状态和模型准入仍在每聊天锁内串行进行，锁在准入后释放；其他聊天独立运行，同一聊天的第二次执行返回 409。HTTP 层只在 `consume` 中初始化 SSE、消费 `call.stream(send)` 并关闭响应，不接管一个已登记但尚未启动的调用。即使响应初始化失败，也由执行服务的外层 `finally` 排空工作并释放活跃记录。
+执行服务通过 `execute(id, identity, input, consume)` 持有整个执行作用域。新输入为 `{ text, modelConfigId }`，继续执行传 null，审批为 `{ interruptId, decisions }`。审批沿用保存的执行模型引用，每次恢复创建新的 invocation、调用预算与超时。归属、状态和模型准入仍在每聊天锁内串行进行，锁在准入后释放；其他聊天独立运行，同一聊天的第二次执行返回 409。HTTP 层只在 `consume` 中初始化 SSE、消费 `call.stream(send)` 并关闭响应，不接管一个已登记但尚未启动的调用。即使响应初始化失败，也由执行服务的外层 `finally` 排空工作并释放活跃记录。
 
 | 所有者             | 职责                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------ |
