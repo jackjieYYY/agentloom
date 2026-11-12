@@ -1,45 +1,29 @@
 import { constants } from 'node:os';
+import { DrizzleQueryError } from 'drizzle-orm';
+import pg from 'pg';
 
-const errorNames = new Set([
-  'Error',
-  'TypeError',
-  'RangeError',
-  'SyntaxError',
-  'ReferenceError',
-  'URIError',
-  'EvalError',
-  'AggregateError',
-  'AbortError',
-]);
-const errorCodes = new Set([
-  ...Object.keys(constants.errno),
-  '28P01', // PostgreSQL authentication failure.
-  '3D000', // Missing database.
-  '42501', // Insufficient privilege.
-  '42P01', // Undefined table.
-  '42703', // Undefined column.
-  '23505', // Unique constraint violation.
-  '23503', // Foreign key constraint violation.
-  '40001', // Serialization failure.
-  '40P01', // Deadlock detected.
-  '53300', // Too many connections.
-  '57P01', // Database shutdown.
-  '57014', // Query cancelled or timed out.
-]);
+export function errorLogFields(error: unknown): { errorCode?: string } {
+  const source = error instanceof DrizzleQueryError ? error.cause : error;
 
-export function safeError(error: unknown) {
-  const name = error instanceof Error ? error.name : undefined;
-  const code =
-    error instanceof Error && 'code' in error ? error.code : undefined;
-  // Names and codes can contain user input too; never log unrecognised values.
-  return {
-    errorType: name && errorNames.has(name) ? name : 'UnknownError',
-    ...(typeof code === 'string' && errorCodes.has(code)
-      ? { errorCode: code }
-      : {}),
-  };
+  if (!(source instanceof Error)) return {};
+  if (!('code' in source)) return {};
+
+  const code = source.code;
+  if (typeof code !== 'string') return {};
+
+  if (source instanceof pg.DatabaseError && /^[0-9A-Z]{5}$/.test(code)) {
+    return { errorCode: code };
+  }
+
+  if (Object.hasOwn(constants.errno, code)) {
+    return { errorCode: code };
+  }
+
+  return {};
 }
 
 export function logError(message: string, error: unknown): void {
-  process.stderr.write(`${JSON.stringify({ message, ...safeError(error) })}\n`);
+  process.stderr.write(
+    `${JSON.stringify({ message, ...errorLogFields(error) })}\n`,
+  );
 }

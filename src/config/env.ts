@@ -16,6 +16,7 @@ const environmentSchema = databaseSchema.extend({
     .pipe(z.coerce.number<string>().int().min(0).max(65535))
     .default(3000),
   LANGSMITH_TRACING: z.literal('false').default('false'),
+  AUTH_JWT_SECRET: z.string().min(32).regex(/\S/),
 });
 
 export type Config = z.infer<typeof environmentSchema>;

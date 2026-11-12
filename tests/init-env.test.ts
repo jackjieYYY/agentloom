@@ -47,9 +47,11 @@ it('generates matching random credentials once without printing secrets', async 
   const env = parseEnv(content);
   expect(env.POSTGRES_PASSWORD).toMatch(/^[a-f0-9]{64}$/);
   expect(new URL(env.DATABASE_URL!).password).toBe(env.POSTGRES_PASSWORD);
-  expect(env.HOST).toBe('127.0.0.1');
+  expect(env.AUTH_JWT_SECRET).toMatch(/^[a-f0-9]{64}$/);
+  expect(env.AUTH_JWT_SECRET).not.toBe(env.POSTGRES_PASSWORD);
   expect((await stat(join(dir, '.env'))).mode & 0o777).toBe(0o600);
   expect(result.stdout + result.stderr).not.toContain(env.POSTGRES_PASSWORD);
+  expect(result.stdout + result.stderr).not.toContain(env.AUTH_JWT_SECRET);
   expect(run(dir).status).toBe(0);
   expect(await readFile(join(dir, '.env'), 'utf8')).toBe(content);
   await expect(stat(join(dir, '.env.init'))).rejects.toMatchObject({
@@ -78,6 +80,7 @@ it.each([
       updated.POSTGRES_PASSWORD,
     );
     expect(updated.POSTGRES_PASSWORD).toMatch(/^[a-f0-9]{64}$/);
+    expect(updated.AUTH_JWT_SECRET).toMatch(/^[a-f0-9]{64}$/);
   },
 );
 
@@ -88,7 +91,21 @@ it.each([
   const dir = await setup();
   await writeFile(join(dir, '.env'), content);
   expect(run(dir).status).toBe(0);
-  expect(await readFile(join(dir, '.env'), 'utf8')).toBe(content);
+  const updated = await readFile(join(dir, '.env'), 'utf8');
+  expect(updated).toContain(content.trimEnd());
+  expect(parseEnv(updated).AUTH_JWT_SECRET).toMatch(/^[a-f0-9]{64}$/);
+  expect(run(dir).status).toBe(0);
+  expect(await readFile(join(dir, '.env'), 'utf8')).toBe(updated);
+});
+
+it('preserves an existing JWT secret while generating database credentials', async () => {
+  const dir = await setup();
+  const secret = 'existing-secret-'.repeat(4);
+  await writeFile(join(dir, '.env'), `AUTH_JWT_SECRET=${secret}\n`);
+  expect(run(dir).status).toBe(0);
+  const env = parseEnv(await readFile(join(dir, '.env'), 'utf8'));
+  expect(env.AUTH_JWT_SECRET).toBe(secret);
+  expect(env.POSTGRES_PASSWORD).toMatch(/^[a-f0-9]{64}$/);
 });
 
 it.each([

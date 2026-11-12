@@ -8,7 +8,7 @@ async function main(): Promise<void> {
   const config = parseConfig(process.env);
   process.env.LANGSMITH_TRACING = 'false';
   const database = createDatabase(config.DATABASE_URL);
-  const app = createApp(database);
+  const app = createApp(database, config);
   const shutdown = createShutdown(app, 10000, () => {
     process.exit(1);
   });
@@ -18,7 +18,6 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     });
   };
-  for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, stop);
   app.addHook('onClose', async () => {
     for (const signal of ['SIGTERM', 'SIGINT'] as const) {
       process.off(signal, stop);
@@ -27,6 +26,9 @@ async function main(): Promise<void> {
 
   try {
     await app.listen({ host: config.HOST, port: config.PORT });
+    for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+      process.on(signal, stop);
+    }
   } catch (error) {
     await shutdown();
     throw error;

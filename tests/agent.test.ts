@@ -1,7 +1,7 @@
 import { AIMessage } from '@langchain/core/messages';
 import { MemorySaver } from '@langchain/langgraph';
 import { expect, it } from 'vitest';
-import { createConversationAgent } from '../src/modules/agent/agent.js';
+import { createConversationAgent } from '../src/agents/agent.js';
 import { callTool, ScriptedModel } from './helpers.js';
 
 it.each([

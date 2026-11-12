@@ -21,19 +21,21 @@ try {
       'Replace existing placeholder credentials before proceeding.',
     );
   }
-  if (env.DATABASE_URL) {
-    console.log('Existing DATABASE_URL preserved; no credentials changed.');
-  } else {
+  const credentials: Record<string, string> = {};
+  if (!env.DATABASE_URL) {
     if (env.POSTGRES_PASSWORD) {
       throw new Error(
         'Set DATABASE_URL to match the existing POSTGRES_PASSWORD.',
       );
     }
     const password = randomBytes(32).toString('hex');
-    const credentials = {
-      POSTGRES_PASSWORD: password,
-      DATABASE_URL: `postgresql://myagents:${password}@127.0.0.1:5432/myagents`,
-    };
+    credentials.POSTGRES_PASSWORD = password;
+    credentials.DATABASE_URL = `postgresql://myagents:${password}@127.0.0.1:5432/myagents`;
+  }
+  if (!env.AUTH_JWT_SECRET) {
+    credentials.AUTH_JWT_SECRET = randomBytes(32).toString('hex');
+  }
+  if (Object.keys(credentials).length > 0) {
     for (const [key, value] of Object.entries(credentials)) {
       const line = new RegExp(`^(?:export\\s+)?${key}\\s*=.*$`, 'gm');
       content = line.test(content)
@@ -43,7 +45,9 @@ try {
     await pending.writeFile(content);
     await pending.close();
     await rename('.env.init', '.env');
-    console.log('Local database credentials saved to .env (mode 0600).');
+    console.log('Credentials saved to .env (mode 0600).');
+  } else {
+    console.log('Existing credentials preserved; no changes.');
   }
 } finally {
   await pending.close();
