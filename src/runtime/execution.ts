@@ -5,12 +5,19 @@ import {
   isToolMessage,
   type BaseMessage,
 } from '@langchain/core/messages';
+import { Command } from '@langchain/langgraph';
+import type { HITLRequest } from 'langchain';
 import { createConversationAgent, type AgentContext } from '../agents/agent.js';
 import { AgentInvocation } from '../agents/invocation.js';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import type { Config } from '../config/env.js';
 import type { Database } from '../database/client.js';
-import { conversations, modelConfigs } from '../database/schema.js';
+import {
+  approvalAudits,
+  conversations,
+  modelConfigs,
+  type ApprovalDecision,
+} from '../database/schema.js';
 
 import { availableModel, configuredModel } from '../models/configuration.js';
 import { AppError } from './app-error.js';
@@ -73,10 +80,57 @@ export function createExecution(
     return snapshot.tasks.some((task) => task.interrupts.length > 0);
   }
 
+  function approvals(snapshot: Awaited<ReturnType<typeof state>>) {
+    return snapshot.tasks.flatMap((task) =>
+      task.interrupts.map(({ id, value }) => {
+        const request = value as HITLRequest;
+        return {
+          interruptId: id!,
+          actions: request.actionRequests.map((action, index) => ({
+            toolName: action.name,
+            // Only the configured echo tool's text preview is public.
+            argumentSummary:
+              action.name === 'echo' && typeof action.args.text === 'string'
+                ? action.args.text.slice(0, 200)
+                : '',
+            allowedDecisions: request.reviewConfigs[index].allowedDecisions,
+          })),
+        };
+      }),
+    );
+  }
+
+  async function approvalState(
+    id: string,
+    snapshot: Awaited<ReturnType<typeof state>>,
+  ) {
+    const approvalAudit = await database.db
+      .select({
+        interruptId: approvalAudits.interruptId,
+        decisions: approvalAudits.decisions,
+        userId: approvalAudits.userId,
+        createdAt: approvalAudits.createdAt,
+      })
+      .from(approvalAudits)
+      .where(eq(approvalAudits.conversationId, id))
+      .orderBy(desc(approvalAudits.createdAt));
+    return {
+      approvalAudit,
+      approvals: approvals(snapshot).map((approval) => ({
+        ...approval,
+        decisionStatus: approvalAudit.some(
+          (audit) => audit.interruptId === approval.interruptId,
+        )
+          ? 'unconfirmed'
+          : 'pending',
+      })),
+    };
+  }
+
   async function streamInvocation(
     id: string,
     identity: AgentContext,
-    text: string | null,
+    input: string | null | Command,
     invocation: AgentInvocation,
     write: EventWriter,
   ) {
@@ -90,10 +144,15 @@ export function createExecution(
       }
     };
     let result = 'completed';
+    let pendingApprovals: Awaited<
+      ReturnType<typeof approvalState>
+    >['approvals'] = [];
     try {
       invocation.signal.throwIfAborted();
       const stream = await agent.stream(
-        text === null ? null : { messages: [{ role: 'user', content: text }] },
+        typeof input === 'string'
+          ? { messages: [{ role: 'user', content: input }] }
+          : input,
         {
           configurable: { thread_id: id },
           context: { ...identity, invocation },
@@ -129,8 +188,10 @@ export function createExecution(
         }
       }
       const latest = await state(id);
-      if (interrupted(latest)) result = 'awaiting_approval';
-      else if (latest.next.length) result = 'unfinished';
+      if (interrupted(latest)) {
+        pendingApprovals = (await approvalState(id, latest)).approvals;
+        result = 'awaiting_approval';
+      } else if (latest.next.length) result = 'unfinished';
     } catch {
       result = invocation.signal.aborted ? 'stopped' : 'error';
       invocation.abort();
@@ -140,7 +201,7 @@ export function createExecution(
     if (invocation.signal.aborted && result !== 'error') result = 'stopped';
     if (result === 'error') await send('error', { error: 'Execution failed' });
     else if (result === 'awaiting_approval')
-      await send('awaiting_approval', {});
+      await send('awaiting_approval', { approvals: pendingApprovals });
     else if (result === 'completed') await send('completed', {});
     await send('end', { status: result });
   }
@@ -155,6 +216,7 @@ export function createExecution(
             .where(eq(modelConfigs.id, row.lastExecutionModelConfigId))
         : [];
       const snapshot = await state(id);
+      const approval = await approvalState(id, snapshot);
       const isActive = active.has(id);
       const awaitingApproval = interrupted(snapshot);
       const unfinished = snapshot.next.length > 0;
@@ -164,11 +226,16 @@ export function createExecution(
         active: isActive,
         awaitingApproval,
         unfinished,
+        ...approval,
+        canApprove:
+          !row.closedAt &&
+          !isActive &&
+          approval.approvals.some((item) => item.decisionStatus === 'pending'),
         canSubmit:
           !row.closedAt && !isActive && !awaitingApproval && !unfinished,
         canContinue:
           !row.closedAt && !isActive && !awaitingApproval && unfinished,
-        // Only conversational text crosses the API boundary; no tool args, files or task errors.
+        // Only conversational text is returned here; approval previews are projected above.
         messages: (
           (snapshot.values.messages as BaseMessage[] | undefined) ?? []
         )
@@ -201,36 +268,74 @@ export function createExecution(
     async execute<T>(
       id: string,
       identity: AgentContext,
-      input: { text: string; modelConfigId: string } | null,
+      input:
+        | { text: string; modelConfigId: string }
+        | { interruptId: string; decisions: ApprovalDecision[] }
+        | null,
       consume: (call: ExecutionCall) => Promise<T>,
     ): Promise<T> {
       if (closing) throw new AppError(503, 'Server stopping');
+      const decision = input && 'decisions' in input ? input : null;
+      const newInput = input && 'text' in input ? input : null;
       const invocation = await locked(id, async () => {
         if (closing) throw new AppError(503, 'Server stopping');
         const row = await owned(id, identity);
         if (row.closedAt) throw new AppError(409, 'Conversation closed');
         if (active.has(id)) throw new AppError(409, 'Execution active');
         const snapshot = await state(id);
-        if (interrupted(snapshot)) throw new AppError(409, 'Approval required');
-        if (input === null && !snapshot.next.length)
-          throw new AppError(409, 'No unfinished work');
-        if (input !== null && snapshot.next.length)
-          throw new AppError(409, 'Unfinished work');
+        if (decision) {
+          const pending = approvals(snapshot).find(
+            (item) => item.interruptId === decision.interruptId,
+          );
+          if (!pending) throw new AppError(409, 'Approval not pending');
+          const [recorded] = await database.db
+            .select({ interruptId: approvalAudits.interruptId })
+            .from(approvalAudits)
+            .where(
+              and(
+                eq(approvalAudits.conversationId, id),
+                eq(approvalAudits.interruptId, decision.interruptId),
+              ),
+            );
+          if (recorded) throw new AppError(409, 'Decision outcome unconfirmed');
+          if (decision.decisions.length !== pending.actions.length)
+            throw new AppError(400, 'Invalid approval decisions');
+        } else {
+          if (interrupted(snapshot))
+            throw new AppError(409, 'Approval required');
+          if (input === null && !snapshot.next.length)
+            throw new AppError(409, 'No unfinished work');
+          if (newInput && snapshot.next.length)
+            throw new AppError(409, 'Unfinished work');
+        }
         const selected = await availableModel(
           database,
-          input === null
-            ? row.lastExecutionModelConfigId!
-            : input.modelConfigId,
+          newInput ? newInput.modelConfigId : row.lastExecutionModelConfigId!,
         );
         const model =
           injectedModel ?? (await configuredModel(selected, config));
-        if (input !== null) {
+        if (newInput) {
           await database.db
             .update(conversations)
             .set({ lastExecutionModelConfigId: selected.id })
             .where(eq(conversations.id, id));
         }
         // Shutdown may have started while the database or saver was awaited.
+        if (closing) throw new AppError(503, 'Server stopping');
+        if (decision) {
+          // Receipt precedes SDK resume; a conflict must never resend the decision.
+          const [accepted] = await database.db
+            .insert(approvalAudits)
+            .values({
+              conversationId: id,
+              ...decision,
+              userId: identity.userId,
+            })
+            .onConflictDoNothing()
+            .returning({ interruptId: approvalAudits.interruptId });
+          if (!accepted)
+            throw new AppError(409, 'Decision outcome unconfirmed');
+        }
         if (closing) throw new AppError(503, 'Server stopping');
         const invocation = new AgentInvocation(model, {
           model: config.AGENT_MODEL_CALL_LIMIT,
@@ -248,7 +353,9 @@ export function createExecution(
               streamInvocation(
                 id,
                 identity,
-                input?.text ?? null,
+                decision
+                  ? new Command({ resume: { decisions: decision.decisions } })
+                  : (newInput?.text ?? null),
                 invocation,
                 send,
               ),

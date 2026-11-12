@@ -1,5 +1,5 @@
 import { AIMessage } from '@langchain/core/messages';
-import { MemorySaver } from '@langchain/langgraph';
+import { Command, MemorySaver } from '@langchain/langgraph';
 import { expect, it } from 'vitest';
 import { createConversationAgent } from '../src/agents/agent.js';
 import { AgentInvocation } from '../src/agents/invocation.js';
@@ -26,6 +26,19 @@ it('reuses one agent, switches models through context and only checkpoints conve
   await agent.invoke(
     { messages: [{ role: 'user', content: 'hello' }] },
     config,
+  );
+  const pending = await agent.graph.getState(config);
+  expect(pending.tasks.flatMap((task) => task.interrupts)).toHaveLength(1);
+  expect(firstModel.seen).toHaveLength(1);
+  await agent.invoke(
+    new Command({ resume: { decisions: [{ type: 'approve' }] } }),
+    {
+      ...config,
+      context: {
+        ...config.context,
+        invocation: new AgentInvocation(firstModel, { model: 2, tool: 1 }),
+      },
+    },
   );
   const names = firstModel.boundTools[0].map((entry) =>
     'name' in entry ? entry.name : undefined,

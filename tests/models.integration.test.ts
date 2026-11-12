@@ -112,7 +112,7 @@ type ProviderRequest = {
   authorization: string | null;
   body: { model: string; messages: { role: string; content: unknown }[] };
 };
-function providerMock(responses: ('text' | 'tool' | 'error')[] = []) {
+function providerMock(responses: ('text' | 'tool' | 'todos' | 'error')[] = []) {
   const calls: ProviderRequest[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const body = JSON.parse(String(init?.body));
@@ -128,7 +128,7 @@ function providerMock(responses: ('text' | 'tool' | 'error')[] = []) {
         { status: 429, headers: { 'content-type': 'application/json' } },
       );
     const delta =
-      response === 'tool'
+      response === 'tool' || response === 'todos'
         ? {
             role: 'assistant',
             tool_calls: [
@@ -136,7 +136,10 @@ function providerMock(responses: ('text' | 'tool' | 'error')[] = []) {
                 index: 0,
                 id: 'call-echo',
                 type: 'function',
-                function: { name: 'echo', arguments: '{"text":"safe"}' },
+                function:
+                  response === 'tool'
+                    ? { name: 'echo', arguments: '{"text":"safe"}' }
+                    : { name: 'write_todos', arguments: '{"todos":[]}' },
               },
             ],
           }
@@ -154,7 +157,8 @@ function providerMock(responses: ('text' | 'tool' | 'error')[] = []) {
         {
           index: 0,
           delta: {},
-          finish_reason: response === 'tool' ? 'tool_calls' : 'stop',
+          finish_reason:
+            response === 'tool' || response === 'todos' ? 'tool_calls' : 'stop',
         },
       ],
     };
@@ -178,6 +182,22 @@ it('switches A → B → A within one chat, preserves tool history and keeps cha
     });
   expect(
     (await post({ text: 'first', modelConfigId: f.modelA })).body,
+  ).toContain('event: awaiting_approval');
+  const pending = (
+    await f.app.inject({ url: f.path, headers: f.headers })
+  ).json();
+  expect(
+    (
+      await f.app.inject({
+        method: 'POST',
+        url: `${f.path}/approvals`,
+        headers: f.headers,
+        payload: {
+          interruptId: pending.approvals[0].interruptId,
+          decisions: [{ type: 'approve' }],
+        },
+      })
+    ).body,
   ).toContain('event: completed');
   expect(
     (await post({ text: 'second', modelConfigId: f.modelB })).body,
@@ -489,7 +509,7 @@ it('keeps provider API output credential-free and encrypts stored keys', async (
 
 it('keeps every in-flight model call fixed while provider routing and model configuration change', async () => {
   const f = await setup();
-  const calls = providerMock(['tool', 'text', 'text']);
+  const calls = providerMock(['todos', 'text', 'text']);
   const fetch = vi.mocked(globalThis.fetch);
   const respond = fetch.getMockImplementation()!;
   const entered = Promise.withResolvers<void>();

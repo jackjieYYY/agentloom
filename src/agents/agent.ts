@@ -42,6 +42,7 @@ export function createConversationAgent({ checkpointer }: AgentOptions) {
     checkpointer,
     contextSchema,
     tools: [echo],
+    interruptOn: { echo: { allowedDecisions: ['approve', 'reject'] } },
     middleware: [
       createMiddleware({
         name: 'InvocationModel',
