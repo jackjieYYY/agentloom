@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import autoload from '@fastify/autoload';
 import Fastify from 'fastify';
+import type { Config } from './config/env.js';
 import type { Database } from './database/client.js';
-import { registerErrorHandlers, sendError } from './http/errors.js';
-import { registerRequestHooks } from './http/requests.js';
-import { healthRoutes } from './modules/health/routes.js';
+import { handleError } from './plugins/errors/handler.js';
 
-export function createApp(database: Database) {
+export function createApp(database: Database, config: Config) {
   const app = Fastify({
     logger: {
       level: 'info',
@@ -19,15 +20,16 @@ export function createApp(database: Database) {
     genReqId: () => randomUUID(),
     forceCloseConnections: 'idle',
     // Routing errors bypass both onRequest and the normal error handler.
-    frameworkErrors: (error, request, reply) =>
-      sendError(error.statusCode ?? 500, request, reply, error),
+    frameworkErrors: handleError,
   });
 
-  registerErrorHandlers(app);
-  registerRequestHooks(app);
-  app.register(healthRoutes, { prefix: '/health', database });
-  app.addHook('onClose', async () => {
-    await database.close();
+  app.register(autoload, {
+    dir: fileURLToPath(new URL('./plugins', import.meta.url)),
+    options: { database },
+  });
+  app.register(autoload, {
+    dir: fileURLToPath(new URL('./routes', import.meta.url)),
+    options: { database, config },
   });
   return app;
 }

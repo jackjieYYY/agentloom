@@ -1,64 +1,74 @@
+import 'tsx';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { expect, it, vi } from 'vitest';
+import { DrizzleQueryError } from 'drizzle-orm';
+import pg from 'pg';
 import { createApp } from '../src/app.js';
 import { parseConfig } from '../src/config/env.js';
 import { createDatabase } from '../src/database/client.js';
-import { safeError } from '../src/runtime/errors.js';
+import { errorLogFields } from '../src/runtime/errors.js';
+import { authEnv } from './auth-helpers.js';
 
 const secret = 'postgresql://user:private-secret@localhost/db';
-const config = parseConfig({ DATABASE_URL: secret });
+const config = parseConfig({ ...authEnv, DATABASE_URL: secret });
 
-it('only retains known error names and codes, never messages or custom fields', () => {
+it('only retains system error codes, never names, messages or custom fields', () => {
   expect(
-    safeError(
+    errorLogFields(
       Object.assign(new TypeError(secret), {
         code: 'ECONNREFUSED',
         detail: secret,
         stack: secret,
       }),
     ),
-  ).toEqual({ errorType: 'TypeError', errorCode: 'ECONNREFUSED' });
-  expect(
-    safeError(
-      Object.assign(new Error(secret), {
-        name: secret,
-        code: secret,
-      }),
-    ),
-  ).toEqual({ errorType: 'UnknownError' });
+  ).toEqual({ errorCode: 'ECONNREFUSED' });
+  for (const code of [secret, 'TOKEN']) {
+    expect(
+      errorLogFields(Object.assign(new Error(secret), { name: secret, code })),
+    ).toEqual({});
+  }
   for (const value of [
     null,
     undefined,
     secret,
-    { name: secret, code: secret },
+    { name: secret, code: 'ECONNREFUSED' },
   ]) {
-    expect(safeError(value)).toEqual({ errorType: 'UnknownError' });
+    expect(errorLogFields(value)).toEqual({});
   }
-  for (const code of [
-    '28P01',
-    '42501',
-    '42P01',
-    '42703',
-    '23505',
-    '23503',
-    '40001',
-    '40P01',
-  ]) {
-    expect(safeError(Object.assign(new Error(secret), { code }))).toEqual({
-      errorType: 'Error',
-      errorCode: code,
-    });
-  }
+  const invalid = new pg.DatabaseError(secret, 0, 'error');
+  invalid.code = secret;
+  expect(errorLogFields(invalid)).toEqual({});
+});
+
+it.each(['23502', '42601', '53100'])(
+  'retains PostgreSQL SQLSTATE %s without database diagnostics',
+  (code) => {
+    const error = new pg.DatabaseError(secret, 0, 'error');
+    error.code = code;
+    error.detail = secret;
+    error.internalQuery = secret;
+    expect(errorLogFields(error)).toEqual({ errorCode: code });
+  },
+);
+
+it('preserves safe driver diagnostics from Drizzle without exposing SQL or parameters', () => {
+  const cause = new pg.DatabaseError(secret, 0, 'error');
+  cause.code = '23502';
+  const error = new DrizzleQueryError('private-secret SQL', [secret], cause);
+  expect(errorLogFields(error)).toEqual({ errorCode: '23502' });
+  expect(JSON.stringify(errorLogFields(error))).not.toContain('private-secret');
 });
 
 it('logs safe request diagnostics without changing the public response', async () => {
   const database = createDatabase(config.DATABASE_URL);
-  const app = createApp(database);
+  const app = createApp(database, config);
   const log = vi.spyOn(app.log, 'error');
   app.get('/failure/:privateValue', async () => {
-    throw Object.assign(new TypeError(secret), { code: 'ECONNREFUSED' });
+    const cause = new pg.DatabaseError(secret, 0, 'error');
+    cause.code = '23502';
+    throw new DrizzleQueryError('private-secret SQL', [secret], cause);
   });
   try {
     const response = await app.inject('/failure/private-secret');
@@ -72,8 +82,7 @@ it('logs safe request diagnostics without changing the public response', async (
         requestId: response.headers['x-request-id'],
         method: 'GET',
         route: '/failure/:privateValue',
-        errorType: 'TypeError',
-        errorCode: 'ECONNREFUSED',
+        errorCode: '23502',
       },
       'Request failed',
     );
@@ -98,7 +107,6 @@ it('reports idle pool errors without exposing database credentials', async () =>
     expect(stderr).toHaveBeenCalledWith(
       `${JSON.stringify({
         message: 'Database idle client failed',
-        errorType: 'Error',
         errorCode: 'ECONNRESET',
       })}\n`,
     );
@@ -149,7 +157,6 @@ it('reports migration connection errors despite unrelated invalid HTTP config', 
   expect(child.status).toBe(1);
   expect(JSON.parse(child.stderr)).toEqual({
     message: 'Database migration failed',
-    errorType: 'Error',
     errorCode: 'ECONNREFUSED',
   });
   expect(child.stderr).not.toContain('private-secret');
@@ -163,6 +170,7 @@ it('preserves the safe startup error code when the listen port is occupied', asy
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
     env: {
       ...process.env,
+      ...authEnv,
       DATABASE_URL: secret,
       HOST: '127.0.0.1',
       PORT: String(address.port),
@@ -179,7 +187,6 @@ it('preserves the safe startup error code when the listen port is occupied', asy
     expect(code).toBe(1);
     expect(JSON.parse(stderr)).toEqual({
       message: 'Server startup failed',
-      errorType: 'Error',
       errorCode: 'EADDRINUSE',
     });
     expect(stderr).not.toContain('private-secret');

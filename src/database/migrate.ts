@@ -1,7 +1,13 @@
+import { fileURLToPath } from 'node:url';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import type { Database } from './client.js';
 
 export async function migrateDatabase(database: Database): Promise<void> {
-  // Business migrations belong here when the first business table is introduced.
+  await migrate(database.db, {
+    migrationsFolder: fileURLToPath(
+      new URL('../../migrations/', import.meta.url),
+    ),
+  });
   // Checkpoint schema is owned exclusively by the official saver.
   await database.saver.setup();
 }

@@ -4,7 +4,7 @@ import type { Database } from '../../database/client.js';
 // Depend only on the capability health checks actually use.
 type HealthOptions = { database: Pick<Database, 'pool'> };
 
-export const healthRoutes: FastifyPluginAsync<HealthOptions> = async (
+const healthRoutes: FastifyPluginAsync<HealthOptions> = async (
   app,
   { database },
 ) => {
@@ -21,3 +21,5 @@ export const healthRoutes: FastifyPluginAsync<HealthOptions> = async (
     }
   });
 };
+
+export default healthRoutes;
