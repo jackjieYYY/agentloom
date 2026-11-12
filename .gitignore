@@ -17,7 +17,6 @@ data/
 postgres-data/
 backups/
 *.sql
-!migrations/*.sql
 *.dump
 *.backup
 *.db

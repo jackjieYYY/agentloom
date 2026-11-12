@@ -1,4 +1,6 @@
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+import { AppError } from '../../runtime/app-error.js';
 import { errorLogFields } from '../../runtime/errors.js';
 
 export function handleError(
@@ -7,10 +9,14 @@ export function handleError(
   reply: FastifyReply,
 ) {
   const status =
-    error.statusCode && error.statusCode >= 400 && error.statusCode < 500
+    error instanceof AppError
       ? error.statusCode
-      : 500;
-  if (status === 500) {
+      : error instanceof z.ZodError
+        ? 400
+        : error.statusCode && error.statusCode >= 400 && error.statusCode < 500
+          ? error.statusCode
+          : 500;
+  if (status >= 500) {
     request.log.error(
       {
         requestId: request.id,
@@ -25,7 +31,12 @@ export function handleError(
     .header('x-request-id', request.id)
     .code(status)
     .send({
-      error: status === 500 ? 'Internal server error' : 'Invalid request',
+      error:
+        error instanceof AppError
+          ? error.message
+          : status === 500
+            ? 'Internal server error'
+            : 'Invalid request',
       requestId: request.id,
     });
 }
