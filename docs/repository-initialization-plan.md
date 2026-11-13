@@ -277,14 +277,16 @@ backend/
 
 不另设与 Step 重复的里程碑。每完成一步，在下表记录关键命令及结论或 CI 链接，重跑此前已落地检查；未通过不标记完成。
 
-| Step                         | 状态   | 已实现能力                                                           |
-| ---------------------------- | ------ | -------------------------------------------------------------------- |
-| 1：工具链与 SDK 最小验证     | 已完成 | 固定依赖、公开 SDK API、状态读取和调用预算探针。                     |
-| 2：HTTP 与 PostgreSQL 基础   | 已完成 | 空库初始化、共享连接池、健康检查、有界退出与 checkpoint 重载。       |
-| 3：可信身份与会话 API        | 已完成 | HS256 JWT、会话归属校验、持久化与重启查询。                          |
-| 4：受控的持久化流式执行      | 已完成 | SSE、调用限额、取消与显式继续；数据库 Provider、聊天分页和模型切换。 |
-| 5：持久化人工审批            | 已完成 | echo 官方 HITL、审批 SSE、最小审计、重复拒绝、重启恢复与取消竞态。   |
-| 6：Docker、CI 与干净环境交付 | 待执行 | —                                                                    |
+| Step                         | 状态   | 已实现能力                                                             |
+| ---------------------------- | ------ | ---------------------------------------------------------------------- |
+| 1：工具链与 SDK 最小验证     | 已完成 | 固定依赖、公开 SDK API、状态读取和调用预算探针。                       |
+| 2：HTTP 与 PostgreSQL 基础   | 已完成 | 空库初始化、共享连接池、健康检查、有界退出与 checkpoint 重载。         |
+| 3：可信身份与会话 API        | 已完成 | HS256 JWT、会话归属校验、持久化与重启查询。                            |
+| 4：受控的持久化流式执行      | 已完成 | SSE、调用限额、取消与显式继续；数据库 Provider、聊天分页和模型切换。   |
+| 5：持久化人工审批            | 已完成 | echo 官方 HITL、审批 SSE、最小审计、重复拒绝、重启恢复与取消竞态。     |
+| 6：Docker、CI 与干净环境交付 | 已完成 | 非 root 多阶段镜像、单实例 Compose、CI、编译产物集成与干净环境 smoke。 |
+
+Step 6 在不含环境文件、依赖及构建产物的干净文件副本中，使用 Node.js 24.16.0、pnpm 11.7.0 与 PostgreSQL 17.7 验收：`pnpm install --frozen-lockfile`、`pnpm check`、`pnpm test`（6 个核心单元用例）、`TEST_DATABASE_URL=... pnpm test:integration`（构建及 40 个集成用例，应用从 `dist/app.js` 加载）、`pnpm exec tsx tests/docker.smoke.ts` 全部通过。镜像 smoke 使用独立 Compose 项目和测试卷，通过独立 `db-init` 服务初始化；非 root、真实健康检查、保留卷重建 API／PostgreSQL 后的会话、结果与待审批查询，以及 SIGTERM 正常退出均通过。生产镜像不包含环境文件、测试代码、tsx、Vitest 或 drizzle-kit。提交 `8b01eb2` 的 GitHub Actions [push CI](https://github.com/jackjieYYY/agentloom/actions/runs/43336908500) 与 [PR CI](https://github.com/jackjieYYY/agentloom/actions/runs/43336965622) 均已通过，覆盖全部已有检查、应用及镜像构建和容器 smoke。
 
 Step 5 验收使用 Node.js 24.16.0、pnpm 11.7.0 和独立 PostgreSQL 测试库：`pnpm install --frozen-lockfile`、`pnpm check`、`pnpm test`（6 个核心单元用例）、`TEST_DATABASE_URL=... pnpm test:integration`（40 个集成用例，含构建及编译产物启动／退出检查）全部通过。审批用例覆盖等待时工具不执行、批准／拒绝、批量决策顺序、权限和输入校验、重启恢复、唯一审计与结果未确认时禁止重发，以及审批和取消的两种准入顺序。
 

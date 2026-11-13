@@ -15,5 +15,49 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  api:
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: postgresql://myagents:${POSTGRES_PASSWORD:?Run node --import tsx scripts/init-env.ts first}@postgres:5432/myagents
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?Run node --import tsx scripts/init-env.ts first}
+      # Leave unset when absent so read-only operation remains available.
+      MODEL_CREDENTIALS_KEY:
+      AGENT_MODEL_CALL_LIMIT: ${AGENT_MODEL_CALL_LIMIT:-10}
+      AGENT_TOOL_CALL_LIMIT: ${AGENT_TOOL_CALL_LIMIT:-20}
+      AGENT_TIMEOUT_MS: ${AGENT_TIMEOUT_MS:-120000}
+    ports:
+      - '127.0.0.1:3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 15s
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+
+  db-init:
+    profiles: ['tools']
+    build:
+      context: .
+      target: build
+    environment:
+      DATABASE_URL: postgresql://myagents:${POSTGRES_PASSWORD:?Run node --import tsx scripts/init-env.ts first}@postgres:5432/myagents
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ['pnpm', 'db:init']
+
 volumes:
   postgres-data:
