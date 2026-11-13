@@ -122,19 +122,20 @@ it('requires an explicit database name before connecting', async () => {
   );
 });
 
-it('checks real readiness and reports unavailable PostgreSQL without leaking details', async () => {
+it('checks database health and reports unavailable PostgreSQL without leaking details', async () => {
   const db = database();
   const app = createApp(db, config);
   try {
-    expect((await app.inject('/health/ready')).statusCode).toBe(200);
+    const healthy = await app.inject('/health');
+    expect(healthy.statusCode).toBe(200);
+    expect(healthy.json()).toEqual({ status: 'ok' });
     await db.close();
-    const response = await app.inject('/health/ready');
+    const response = await app.inject('/health');
     expect(response.statusCode).toBe(503);
     expect(response.json()).toEqual({
       error: 'Database unavailable',
       requestId: response.headers['x-request-id'],
     });
-    expect((await app.inject('/health/live')).statusCode).toBe(200);
   } finally {
     await app.close();
   }
@@ -152,7 +153,7 @@ it('checks real readiness and reports unavailable PostgreSQL without leaking det
   databases.push(unavailable);
   const offline = createApp(unavailable, config);
   try {
-    expect((await offline.inject('/health/ready')).statusCode).toBe(503);
+    expect((await offline.inject('/health')).statusCode).toBe(503);
   } finally {
     await offline.close();
   }
@@ -273,7 +274,7 @@ it('runs compiled ESM, preserves conversations across restarts and exits on SIGT
           );
           child.once('error', reject);
         });
-        expect((await fetch(`${address}/health/ready`)).status).toBe(200);
+        expect((await fetch(`${address}/health`)).status).toBe(200);
         if (!conversation) {
           const created = await fetch(`${address}/conversations`, {
             method: 'POST',

@@ -149,7 +149,7 @@ SDK 用法以锁定版本的 JS/TS 类型、reference 和测试为准，不混�
 2. 用 Zod 一次解析环境变量，非法配置启动失败且不输出密钥。使用 Fastify/Pino、request ID、统一错误响应和请求体大小限制；CORS 由 Nginx 统一处理，后端不处理跨域或预检请求。
 3. 在 `compose.yaml` 加入固定版本的 PostgreSQL、健康检查和持久卷。创建共享 `pg.Pool`、Drizzle 和官方 saver，验证连接池复用；本步不提前创建业务表。
 4. 增加 `db:init`，按第 2.2 节准备当前业务表和 saver；不维护历史版本迁移，不创建假表。
-5. 增加 `/health/live` 和 `/health/ready`，分别检查进程响应和真实数据库连接。SIGTERM 停止接收请求、有界等待在途请求，最后仅关闭一次共享连接池。
+5. 增加 `GET /health`，检查真实数据库连接，成功返回 200，失败返回 503，无需认证。SIGTERM 停止接收请求、有界等待在途请求，最后仅关闭一次共享连接池。
 6. 增加 `test:integration`，使用 fake Agent 和真实 PostgreSQL saver，通过 SDK 验证状态保存与重新加载，并验证健康检查及连接池退出；README 写明数据库启动、初始化和服务命令。
 
 ### 验收

@@ -30,7 +30,7 @@ docker compose up -d --wait postgres
 # 仅在首次准备或主动清空数据库时执行；会删除整个 database。
 docker compose run --rm db-init
 docker compose up -d --wait api
-curl --fail http://127.0.0.1:3000/health/ready
+curl --fail http://127.0.0.1:3000/health
 ```
 
 `db-init` 是按需运行的工具服务，执行同一个 `pnpm db:init`，不会随 `docker compose up` 启动。API 使用非 root 用户运行，仅包含生产依赖和编译产物，启动时不初始化数据库。Compose 将 PostgreSQL 和 API 分别绑定到本机 `5432`、`3000`；API 使用容器内的 PostgreSQL 地址。API 限制为 1 CPU、1 GiB 内存及 128 个进程，停止宽限期为 15 秒，服务内部退出上限为 10 秒。
@@ -58,7 +58,7 @@ pnpm db:init
 pnpm dev
 ```
 
-使用本地 API 前先停止 Compose API，避免占用同一个端口或同时执行：`docker compose stop api`。验证生产编译产物可用 `pnpm build && pnpm start`，不需要 TypeScript 运行器。默认监听 `127.0.0.1:3000`；`HOST`、`PORT` 可通过环境变量覆盖。`/health/live` 检查进程响应，`/health/ready` 会实际查询 PostgreSQL；二者不需要认证。
+使用本地 API 前先停止 Compose API，避免占用同一个端口或同时执行：`docker compose stop api`。验证生产编译产物可用 `pnpm build && pnpm start`，不需要 TypeScript 运行器。默认监听 `127.0.0.1:3000`；`HOST`、`PORT` 可通过环境变量覆盖。`GET /health` 实际查询 PostgreSQL，成功返回 200，失败返回 503，无需认证。
 
 ## 认证、输入与 SSE
 
