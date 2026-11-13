@@ -11,7 +11,7 @@ import {
   modelConfigs,
   modelProviders,
 } from '../src/database/schema.js';
-import { jwtFixture } from './auth-helpers.js';
+import { jwtFixture, prepareUsers, userA, userB } from './auth-helpers.js';
 import { ScriptedModel } from './helpers.js';
 
 const url = process.env.TEST_DATABASE_URL;
@@ -35,7 +35,7 @@ afterEach(async () => {
 });
 
 async function setup(model?: ScriptedModel) {
-  const userId = `models-${randomUUID()}`;
+  const userId = randomUUID();
   const fixture = jwtFixture();
   const config = parseConfig({
     DATABASE_URL: url,
@@ -44,6 +44,7 @@ async function setup(model?: ScriptedModel) {
   });
   await initializeDatabase(url!);
   const database = createDatabase(url!);
+  await prepareUsers(database, [userId, userA, userB]);
   const app = createApp(database, config, model);
   apps.push(app);
   const headers = {
@@ -319,10 +320,10 @@ it('shares model selection globally while isolating paginated chats by owner', a
   const f = await setup();
   const calls = providerMock();
   const otherHeaders = {
-    authorization: `Bearer ${await f.fixture.sign({ sub: `other-${randomUUID()}` })}`,
+    authorization: `Bearer ${await f.fixture.sign({ sub: userA })}`,
   };
   const userHeaders = {
-    authorization: `Bearer ${await f.fixture.sign({ sub: 'other-user' })}`,
+    authorization: `Bearer ${await f.fixture.sign({ sub: userB })}`,
   };
   for (let i = 0; i < 3; i++)
     await f.app.inject({
@@ -617,7 +618,7 @@ it('validates configuration requests and shares management APIs across users', a
   const f = await setup();
   const foreignHeaders = { authorization: '' };
   foreignHeaders.authorization =
-    'Bearer ' + (await f.fixture.sign({ sub: 'foreign-' + randomUUID() }));
+    'Bearer ' + (await f.fixture.sign({ sub: userA }));
   for (const path of ['/providers', '/models']) {
     expect((await f.app.inject({ url: path })).statusCode).toBe(401);
     expect(
@@ -784,7 +785,7 @@ it('validates configuration requests and shares management APIs across users', a
     ).statusCode,
   ).toBe(200);
   const userHeaders = {
-    authorization: 'Bearer ' + (await f.fixture.sign({ sub: 'another-user' })),
+    authorization: 'Bearer ' + (await f.fixture.sign({ sub: userB })),
   };
   expect(
     (
