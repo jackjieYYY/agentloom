@@ -1,0 +1,9 @@
+# Only build inputs enter the context; secrets, Git, tests and data stay outside.
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!tsconfig.json
+!tsconfig.build.json
+!src/
+!src/**
