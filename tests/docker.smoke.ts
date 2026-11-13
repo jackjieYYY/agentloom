@@ -63,8 +63,11 @@ try {
     ...env,
     DATABASE_URL: `postgresql://myagents:${env.POSTGRES_PASSWORD}@${postgresAddress}/myagents`,
   });
-  const authorization = `Bearer ${await fixture.sign({ exp: Math.floor(Date.now() / 1000) + 3600 })}`;
-  const headers = { authorization };
+  const credentials = {
+    email: 'smoke@example.com',
+    password: randomBytes(24).toString('hex'),
+  };
+  let user: unknown;
   const app = createApp(
     createDatabase(config.DATABASE_URL),
     config,
@@ -75,6 +78,20 @@ try {
   );
   const saved: { id: string; state: unknown }[] = [];
   try {
+    const registered = await app.inject({
+      method: 'POST',
+      url: '/auth/register',
+      payload: credentials,
+    });
+    assert.equal(registered.statusCode, 201);
+    user = registered.json().user;
+    const loggedIn = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: credentials,
+    });
+    assert.equal(loggedIn.statusCode, 200);
+    const headers = { authorization: `Bearer ${loggedIn.json().accessToken}` };
     const provider = await app.inject({
       method: 'POST',
       url: '/providers',
@@ -121,6 +138,21 @@ try {
     const address = await compose('port', 'api', '3000');
     assert.equal((await fetch(`http://${address}/health`)).status, 200);
     assert.notEqual(await compose('exec', '-T', 'api', 'id', '-u'), '0');
+    const loggedIn = await fetch(`http://${address}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(credentials),
+    });
+    assert.equal(loggedIn.status, 200);
+    const login = (await loggedIn.json()) as {
+      accessToken: string;
+      user: unknown;
+    };
+    assert.deepEqual(login.user, user);
+    const headers = { authorization: `Bearer ${login.accessToken}` };
+    const me = await fetch(`http://${address}/auth/me`, { headers });
+    assert.equal(me.status, 200);
+    assert.deepEqual(await me.json(), { user });
     for (const { id, state } of saved) {
       const response = await fetch(`http://${address}/conversations/${id}`, {
         headers,
@@ -142,7 +174,9 @@ try {
     // Recreate both containers while preserving the named PostgreSQL volume.
     await compose('down');
   }
-  console.log('Docker smoke passed: non-root, health, persistence and SIGTERM');
+  console.log(
+    'Docker smoke passed: login, non-root, health, persistence and SIGTERM',
+  );
 } catch (error) {
   console.error(await compose('logs', '--no-color').catch(() => ''));
   throw error;

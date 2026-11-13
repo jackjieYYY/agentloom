@@ -13,7 +13,13 @@ import { ScriptedModel } from './helpers.js';
 import { parseConfig } from '../src/config/env.js';
 import { conversations, modelProviders } from '../src/database/schema.js';
 import { eq, sql } from 'drizzle-orm';
-import { authEnv, jwtFixture } from './auth-helpers.js';
+import {
+  authEnv,
+  jwtFixture,
+  prepareUsers,
+  userA,
+  userB,
+} from './auth-helpers.js';
 
 // Deliberately separate from DATABASE_URL: never silently target a production DB.
 const url = process.env.TEST_DATABASE_URL;
@@ -163,6 +169,7 @@ it('creates owned conversations and denies other users and guessed IDs', async (
   await initializeDatabase(url!);
   const db = database();
   const fixture = jwtFixture();
+  await prepareUsers(db);
   const app = createApp(
     db,
     parseConfig({ DATABASE_URL: url, ...fixture.env, NODE_ENV: 'production' }),
@@ -192,7 +199,7 @@ it('creates owned conversations and denies other users and guessed IDs', async (
       .select()
       .from(conversations)
       .where(eq(conversations.id, conversationId!));
-    expect(stored).toMatchObject({ userId: 'user-a' });
+    expect(stored).toMatchObject({ userId: userA });
     const owned = await app.inject({
       url: `/conversations/${conversationId}`,
       headers: { authorization },
@@ -205,12 +212,12 @@ it('creates owned conversations and denies other users and guessed IDs', async (
       active: false,
     });
 
-    for (const claims of [{ sub: 'user-b' }]) {
+    for (const claims of [{ sub: userB }]) {
       const denied = await app.inject({
-        url: `/conversations/${conversationId}?userId=user-a&thread_id=${conversationId}`,
+        url: `/conversations/${conversationId}?userId=${userA}&thread_id=${conversationId}`,
         headers: {
           authorization: `Bearer ${await fixture.sign(claims)}`,
-          'x-user-id': 'user-a',
+          'x-user-id': userA,
         },
       });
       expect(denied.statusCode).toBe(404);
@@ -243,6 +250,7 @@ it('runs compiled ESM, preserves conversations across restarts and exits on SIGT
   await initializeDatabase(url!);
   const db = database();
   const fixture = jwtFixture();
+  await prepareUsers(db);
   const authorization = `Bearer ${await fixture.sign()}`;
   let conversation: { conversationId: string; createdAt: string } | undefined;
   try {

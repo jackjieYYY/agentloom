@@ -14,7 +14,7 @@ import { initializeDatabase } from '../src/database/initialize.js';
 import { approvalAudits, modelConfigs } from '../src/database/schema.js';
 import { createExecution } from '../src/runtime/execution.js';
 import { createProvider, createModel } from '../src/models/manage.js';
-import { jwtFixture } from './auth-helpers.js';
+import { jwtFixture, prepareUsers, userA, userB } from './auth-helpers.js';
 import { callTool, ScriptedModel } from './helpers.js';
 
 const url = process.env.TEST_DATABASE_URL;
@@ -42,6 +42,7 @@ async function setup(
   });
   await initializeDatabase(url!);
   const database = createDatabase(url!);
+  await prepareUsers(database);
   let modelConfigId: string | undefined;
   if (model) {
     const provider = await createProvider(
@@ -130,7 +131,7 @@ it('streams tools, messages and completion, retains history and isolates convers
   expect(first.body).toContain('event: end');
   expect(first.body).not.toContain('safe echo');
   expect(first.body).not.toContain('private reasoning');
-  expect(first.body).not.toContain('user-a');
+  expect(first.body).not.toContain(userA);
   expect((await f.post('input', { text: 'follow up' })).body).toContain(
     'follow-up answer',
   );
@@ -174,7 +175,7 @@ it('authorizes every execution, read and cancel operation and validates request 
   const model = new ScriptedModel([]);
   const f = await setup(model);
   for (const action of ['', '/input', '/continue', '/cancel', '/approvals']) {
-    for (const claims of [undefined, { sub: 'other' }]) {
+    for (const claims of [undefined, { sub: userB }]) {
       const response = await f.app.inject({
         method: action ? 'POST' : 'GET',
         url: `${f.path}${action}`,
@@ -472,7 +473,7 @@ it('owns transport setup and keeps the slot through terminal output and shutdown
   const model = new ScriptedModel([new AIMessage('answer')]);
   const f = await setup(model);
   const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: 'user-a' };
+  const identity = { userId: userA };
   const setupError = new Error('response setup failed');
   await expect(
     execution.execute(
@@ -565,7 +566,7 @@ it('aborts a live model before closing the graph iterator when output fails', as
   const model = new StreamingModel([new AIMessage('first chunk')]);
   const f = await setup(model);
   const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: 'user-a' };
+  const identity = { userId: userA };
   const writeError = new Error('response write failed');
   let abort = () => {};
   const running = execution.execute(
@@ -596,7 +597,7 @@ it('waits for in-flight admission during shutdown and never starts its agent', a
   const model = new ScriptedModel([]);
   const f = await setup(model);
   const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: 'user-a' };
+  const identity = { userId: userA };
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   releases.push(release.resolve);
@@ -755,7 +756,7 @@ it('persists pending approvals, blocks bypasses and resumes with fresh limits af
       {
         interruptId: decision.interruptId,
         decisions: decision.decisions,
-        userId: 'user-a',
+        userId: userA,
         createdAt: expect.any(String),
       },
     ],
@@ -840,7 +841,7 @@ it('never resumes without an audit receipt or resends a recorded decision whose 
   expect(await f.database.db.select().from(approvalAudits)).toEqual([]);
   const execution = createExecution(f.database, f.config, model);
   await expect(
-    execution.execute(f.id, { userId: 'user-a' }, decision, async () => {
+    execution.execute(f.id, { userId: userA }, decision, async () => {
       throw new Error('response setup failed after receipt');
     }),
   ).rejects.toThrow('response setup failed after receipt');
@@ -856,7 +857,7 @@ it('never resumes without an audit receipt or resends a recorded decision whose 
   await expect(
     f.database.db
       .insert(approvalAudits)
-      .values({ conversationId: f.id, ...decision, userId: 'user-a' }),
+      .values({ conversationId: f.id, ...decision, userId: userA }),
   ).rejects.toThrow();
   // A later model configuration change cannot turn a recorded decision into a retry.
   await f.database.db.update(modelConfigs).set({ enabled: false });
@@ -909,7 +910,7 @@ it.each([true, false])(
     const { interruptId } = (await f.query()).json().approvals[0];
     const decision = { interruptId, decisions: [{ type: 'approve' }] };
     const execution = createExecution(f.database, f.config, model);
-    const identity = { userId: 'user-a' };
+    const identity = { userId: userA };
     const events: string[] = [];
     const approve = () =>
       execution
