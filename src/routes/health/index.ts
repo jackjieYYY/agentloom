@@ -8,8 +8,7 @@ const healthRoutes: FastifyPluginAsync<HealthOptions> = async (
   app,
   { database },
 ) => {
-  app.get('/live', async () => ({ status: 'ok' }));
-  app.get('/ready', async (request, reply) => {
+  app.get('/', async (request, reply) => {
     try {
       await database.pool.query('SELECT 1');
       return { status: 'ok' };

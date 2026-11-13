@@ -119,8 +119,7 @@ try {
     );
     await compose('up', '-d', '--wait', '--wait-timeout', '60', 'api');
     const address = await compose('port', 'api', '3000');
-    assert.equal((await fetch(`http://${address}/health/live`)).status, 200);
-    assert.equal((await fetch(`http://${address}/health/ready`)).status, 200);
+    assert.equal((await fetch(`http://${address}/health`)).status, 200);
     assert.notEqual(await compose('exec', '-T', 'api', 'id', '-u'), '0');
     for (const { id, state } of saved) {
       const response = await fetch(`http://${address}/conversations/${id}`, {
