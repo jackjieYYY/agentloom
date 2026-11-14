@@ -480,6 +480,102 @@ it('rotates credentials, rejects disabled selections without fallback, and permi
   ).toBe(200);
 });
 
+it('discovers upstream models using saved provider credentials without changing local models', async () => {
+  const f = await setup();
+  await f.request('PATCH', `/providers/${f.providerA}`, {
+    baseUrl: 'https://a.models.example/api/v1/',
+    apiKey: 'discovery-private-key',
+    enabled: false,
+  });
+  const upstream = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    Response.json({
+      object: 'list',
+      data: [
+        { id: 'chat-model', owned_by: 'upstream' },
+        { id: 'embedding-model' },
+      ],
+    }),
+  );
+  const path = `/providers/${f.providerA}/models`;
+  expect((await f.app.inject({ url: path })).statusCode).toBe(401);
+  expect(upstream).not.toHaveBeenCalled();
+  const result = await f.app.inject({ url: path, headers: f.headers });
+  expect(result.statusCode).toBe(200);
+  expect(result.json()).toEqual({
+    models: [{ modelName: 'chat-model' }, { modelName: 'embedding-model' }],
+  });
+  expect(upstream).toHaveBeenCalledWith(
+    'https://a.models.example/api/v1/models',
+    expect.objectContaining({
+      headers: { Authorization: 'Bearer discovery-private-key' },
+      redirect: 'error',
+      signal: expect.any(AbortSignal),
+    }),
+  );
+  expect(result.body).not.toContain('private-key');
+  const local = await f.app.inject({ url: '/models', headers: f.headers });
+  expect(local.json()).toHaveLength(2);
+  upstream.mockResolvedValueOnce(Response.json({ data: [] }));
+  expect(
+    (await f.app.inject({ url: path, headers: f.headers })).json(),
+  ).toEqual({ models: [] });
+});
+
+it('validates discovery requests and sanitizes upstream and credential failures', async () => {
+  const f = await setup();
+  const upstream = vi.spyOn(globalThis, 'fetch');
+  for (const [id, status] of [
+    ['invalid', 400],
+    [randomUUID(), 404],
+  ] as const) {
+    const result = await f.app.inject({
+      url: `/providers/${id}/models`,
+      headers: f.headers,
+    });
+    expect(result.statusCode).toBe(status);
+  }
+  expect(upstream).not.toHaveBeenCalled();
+  const path = `/providers/${f.providerA}/models`;
+  const noKey = createApp(createDatabase(url!), {
+    ...f.config,
+    MODEL_CREDENTIALS_KEY: undefined,
+  });
+  apps.push(noKey);
+  expect(
+    (await noKey.inject({ url: path, headers: f.headers })).statusCode,
+  ).toBe(503);
+  expect(upstream).not.toHaveBeenCalled();
+  for (const response of [
+    new Response('private-key upstream error', { status: 401 }),
+    new Response('unsupported', { status: 404 }),
+    new Response('private-key invalid JSON'),
+    Response.json({ data: [{ id: 42 }] }),
+  ]) {
+    upstream.mockResolvedValueOnce(response);
+    const result = await f.app.inject({ url: path, headers: f.headers });
+    expect(result.statusCode).toBe(502);
+    expect(result.json().error).toBe('Upstream model discovery failed');
+    expect(result.body).not.toContain('private-key');
+  }
+  upstream.mockRejectedValueOnce(new Error('private-key connection failed'));
+  expect(
+    (await f.app.inject({ url: path, headers: f.headers })).statusCode,
+  ).toBe(502);
+  upstream.mockImplementationOnce(async () => {
+    throw new Error('private-key timeout');
+  });
+  const timeout = vi
+    .spyOn(AbortSignal, 'timeout')
+    .mockReturnValue(AbortSignal.abort());
+  try {
+    const result = await f.app.inject({ url: path, headers: f.headers });
+    expect(result.statusCode).toBe(504);
+    expect(result.json().error).toBe('Upstream model discovery timed out');
+  } finally {
+    timeout.mockRestore();
+  }
+});
+
 it('keeps provider API output credential-free and encrypts stored keys', async () => {
   const f = await setup();
   const created = await f.request('POST', '/providers', {
