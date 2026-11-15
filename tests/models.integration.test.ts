@@ -779,7 +779,7 @@ it('validates configuration requests and shares management APIs across users', a
     {
       method: 'PATCH',
       url: '/providers/' + f.providerA,
-      payload: { baseUrl: 'http://unsafe.example' },
+      payload: { baseUrl: 'invalid-url' },
     },
     {
       method: 'PATCH',

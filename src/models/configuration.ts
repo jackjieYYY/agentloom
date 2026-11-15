@@ -8,19 +8,7 @@ import { AppError } from '../runtime/app-error.js';
 import { decryptApiKey } from './credentials.js';
 
 export const providerType = z.enum(['openai', 'openai-compatible']);
-export const providerUrl = z
-  .url()
-  .max(2048)
-  .refine((value) => {
-    const url = new URL(value);
-    return (
-      url.protocol === 'https:' &&
-      !url.username &&
-      !url.password &&
-      !url.search &&
-      !url.hash
-    );
-  });
+export const providerUrl = z.url().max(2048);
 
 export async function availableModel(database: Database, id: string) {
   const [row] = await database.db

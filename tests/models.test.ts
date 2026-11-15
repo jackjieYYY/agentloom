@@ -1,6 +1,33 @@
 import { expect, it } from 'vitest';
 import { CompactEncrypt, compactDecrypt, decodeProtectedHeader } from 'jose';
 import { decryptApiKey, encryptApiKey } from '../src/models/credentials.js';
+import {
+  createProviderBody,
+  updateProviderBody,
+} from '../src/models/manage.js';
+
+it('accepts provider URLs and validates their format and length for writes', () => {
+  for (const baseUrl of [
+    'http://localhost:8080/v1',
+    'https://user:pass@models.example/v1?key=value#section',
+  ]) {
+    expect(
+      createProviderBody.safeParse({
+        name: 'Provider',
+        type: 'openai-compatible',
+        apiKey: 'key',
+        baseUrl,
+      }).success,
+    ).toBe(true);
+    expect(updateProviderBody.safeParse({ baseUrl }).success).toBe(true);
+  }
+  for (const baseUrl of [
+    'invalid-url',
+    'https://models.example/' + 'a'.repeat(2048),
+  ]) {
+    expect(updateProviderBody.safeParse({ baseUrl }).success).toBe(false);
+  }
+});
 
 it('stores authenticated JWE with random IVs and binds credentials to the provider', async () => {
   const key = 'ab'.repeat(32);
