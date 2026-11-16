@@ -1,3 +1,4 @@
+import type { Decision } from 'langchain';
 import {
   boolean,
   index,
@@ -55,14 +56,12 @@ export const modelConfigs = pgTable('model_configs', {
     .notNull(),
 });
 
-export type ApprovalDecision = { type: 'approve' | 'reject' };
-
 export const approvalAudits = pgTable(
   'approval_audits',
   {
     conversationId: uuid('conversation_id').notNull(),
     interruptId: text('interrupt_id').notNull(),
-    decisions: jsonb('decisions').$type<ApprovalDecision[]>().notNull(),
+    decisions: jsonb('decisions').$type<Decision[]>().notNull(),
     userId: text('user_id').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true })
       .defaultNow()

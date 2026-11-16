@@ -10,7 +10,7 @@ import { createApp } from './app.js';
 import { parseConfig } from '../src/config/env.js';
 import { createDatabase } from '../src/database/client.js';
 import { jwtFixture } from './auth-helpers.js';
-import { callTool, ScriptedModel } from './helpers.js';
+import { callTool, ScriptedModel, startInput } from './helpers.js';
 
 // An isolated Compose project and random ports never touch the developer's DB.
 const directory = await mkdtemp(join(tmpdir(), 'agentloom-smoke-'));
@@ -106,7 +106,7 @@ try {
       payload: { providerId: provider.json().providerId, modelName: 'smoke' },
     });
     assert.equal(model.statusCode, 201);
-    for (const event of ['completed', 'awaiting_approval']) {
+    for (const event of ['completed', '__interrupt__']) {
       const created = await app.inject({
         method: 'POST',
         url: '/conversations',
@@ -116,12 +116,15 @@ try {
       const id: string = created.json().conversationId;
       const response = await app.inject({
         method: 'POST',
-        url: `/conversations/${id}/input`,
+        url: `/conversations/${id}/runs`,
         headers,
-        payload: { text: 'smoke', modelConfigId: model.json().modelConfigId },
+        ...startInput({
+          text: 'smoke',
+          modelConfigId: model.json().modelConfigId,
+        }),
       });
       assert.equal(response.statusCode, 200);
-      assert.ok(response.body.includes(`event: ${event}\n`));
+      assert.ok(response.body.includes(event));
       const state = await app.inject({ url: `/conversations/${id}`, headers });
       assert.equal(state.statusCode, 200);
       saved.push({ id, state: state.json() });

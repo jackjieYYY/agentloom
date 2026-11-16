@@ -30,55 +30,61 @@ SDK 提供 `modelCallLimitMiddleware` 和 `toolCallLimitMiddleware`。当前锁�
 
 参考：[Harness profiles](https://docs.langchain.com/oss/javascript/deepagents/profiles#harness-profiles)、[Built-in middleware](https://docs.langchain.com/oss/javascript/langchain/middleware/built-in)。
 
-## 消息、流和恢复
+## 原生输入、事件与恢复
 
-| 功能           | 使用的公开 SDK 机制                                                       |
-| -------------- | ------------------------------------------------------------------------- |
-| 聊天历史       | 每个聊天独立的 `configurable.thread_id`，使用 PostgreSQL checkpointer     |
-| 查询           | `agent.graph.getState()`，只读取最新保存状态                              |
-| 新输入         | `agent.stream({ messages }, config)`，沿用相同 thread 的历史              |
-| 错误后继续     | `agent.stream(null, config)`，不传历史 checkpoint ID                      |
-| 待审批中断     | `interruptOn.echo` 仅允许 approve / reject；读取 SDK task interrupts      |
-| 审批恢复       | 校验当前中断并先写审计，再传 `Command({ resume: { decisions } })`         |
-| 流式输出       | SDK `messages` 与 `updates` 流模式，服务端投影成脱敏 SSE                  |
-| 文本与消息类型 | SDK `message.text`、`isHumanMessage`、`isAIMessage`、`isToolMessage`      |
-| 停止           | 向 SDK 传递 `AbortSignal`，等待流、hooks 和模型生命周期结束后释放活跃记录 |
-| 持久性         | 执行设置 `durability: 'sync'`；沿用官方 saver 的初始化与连接池            |
+执行直接使用 `agent.streamEvents(input, { version: 'v3', ...config })`。HTTP 请求体采用 SDK 的输入形状；SSE 每个 `data` 是 SDK 产生的 `ProtocolEvent` 经 JSON 序列化后的原值。消息、工具、更新、状态和 lifecycle 事件的内容、顺序与序号均由 SDK 决定。
 
-待审批内容仅保存在官方 checkpoint。会话查询与 `awaiting_approval` SSE 只返回中断 ID、工具名、echo 文本的前 200 字符及允许的决策，不返回完整中断、工具参数或图状态。批量决策按 SDK `actionRequests` 的顺序一一对应，拒绝会把拒绝结果交给模型，模型再次请求同一工具时产生新的审批。
+| 功能           | HTTP / SDK 输入                                                                                      |
+| -------------- | ---------------------------------------------------------------------------------------------------- |
+| 创建、列出会话 | `POST /conversations`、`GET /conversations`，按 userId 隔离                                          |
+| 新输入         | `POST /conversations/:id/runs?modelConfigId=:id`，请求体 `{ messages: [{ role: 'user', content }] }` |
+| 普通继续       | `POST /conversations/:id/runs`，请求体 `null` 或空请求体；SDK 输入为 `null`                          |
+| 审批恢复       | 同一运行接口，请求体 `{ resume: { [interruptId]: { decisions } } }`，由 `new Command(body)` 恢复     |
+| 保存状态       | `GET /conversations/:id`，直接返回 `agent.graph.getState()` 的 snapshot                              |
+| 业务信息       | `GET /conversations/:id/metadata`，返回会话记录、active 和 approvalAudit                             |
+| 关闭会话       | `POST /conversations/:id/cancel`，保存关闭标记并通知当前调用停止                                     |
 
-`approval_audits` 只保存会话、中断 ID、决策数组、可信 userId 和时间，以会话和中断 ID 为复合主键。准入锁内校验当前中断、写入审计，然后才启动 SDK；这两个持久化操作不构成跨表原子提交。审计只证明已接收决策。若同一中断仍在且已有审计，查询返回 `decisionStatus: unconfirmed`，再次提交返回 409 `Decision outcome unconfirmed`，不自动重发。操作者可以查询，或取消会话后另建会话。
+新输入仅接受一条用户消息，`content` 原样传递和保存，保留首尾空白、缩进、制表符与换行；全空白或超过 32000 字符返回 400。新输入必须选择模型，继续与审批沿用保存的执行模型配置 ID，不接受覆盖。
 
-没有自写的消息内容解析器或第二套消息历史。`message.text` 通过 SDK 的标准内容块提取文本，思考块、工具参数和其他内部内容不进入公开文本响应。API 的 SSE 是业务投影，客户端使用 `fetch` 读取；未宣称兼容 Agent Server 的 HTTP 协议或 `useStream`。
+前端可以通过 `@langchain/langgraph-sdk/utils` 的 `BytesLineDecoder` 和 `SSEDecoder` 读取 SSE。一次请求对应一次执行，响应结束后读取 snapshot；事件的 `seq` 属于该次 SDK 运行。执行、连接和收尾共用一个调用作用域，客户端断线会请求取消；服务不保留传输事件缓存或自动重发输入。
 
-LangGraph 的新输入、错误后继续、审批恢复和历史重放语义不同，不能只凭相同 thread ID 判断为恢复。进程重启不自动执行任务；取消聊天先保存关闭状态再请求停止，停止信号不代表在途工作已经结束。
+SDK 输出对会话所属用户完整可见，包括工具参数、工具结果、reasoning、SDK 状态、元数据和执行错误中实际存在的内容。后端不生成摘要 DTO、筛选频道、重编号、改写生命周期或补造事件。认证失败、输入非法和执行准入等 HTTP 错误仍按统一错误处理器返回。
 
-开发阶段改变图结构后不承诺旧的未完成 checkpoint 跨版本恢复；需要保留的状态必须另行验证。服务不会自动清空数据库或重提输入。
+`AgentInvocation` 作为 runtime context 依赖，Provider 凭证在模型客户端中使用；账号密码、应用配置和运行时对象不加入输入或 checkpoint。授权和会话归属仍在服务端校验。
 
-参考：[Checkpointers](https://docs.langchain.com/oss/javascript/langgraph/checkpointers)、[Messages](https://docs.langchain.com/oss/javascript/langchain/messages)、[Streaming](https://docs.langchain.com/oss/javascript/langchain/streaming)。
+审批直接使用 snapshot 的 `tasks[].interrupts`。其 `id` 为恢复键，`value` 是 SDK 的批量 HITL 请求，包含 `actionRequests` 与 `reviewConfigs`。`interruptOn: { echo: true }` 开放四种原生决策，审批说明使用 SDK 默认的工具名和完整参数；显示折叠由前端处理。决策的数量和顺序对应 `actionRequests`。
+
+- `approve`：按原始调用执行。
+- `edit`：使用 `editedAction: { name, args }` 替换调用后执行；工具参数由 SDK 校验。
+- `reject`：跳过工具并返回拒绝反馈，可以携带 `message`。
+- `respond`：跳过工具，把必填 `message` 作为成功的工具结果返回给模型。
+
+HTTP 边界校验当前批量模式的官方决策结构，请求体传入 `new Command(body)`。执行层使用 `HITLResponse`，审计使用官方 `Decision[]`，保留编辑参数和反馈原文。
+
+`approval_audits` 以会话和中断 ID 为复合主键，保存决策、可信 userId 和时间。准入先验证当前中断与审计，再检查执行模型，随后写入审计并启动 SDK。审计只证明收到决策；若审计已经存在但 checkpoint 仍保留该中断，再次提交返回 409 `Decision outcome unconfirmed`，不自动重发或补偿。客户端结合原生中断与 metadata 中的审计判断待审批状态。
+
+当前锁定 SDK 的原始流在审批时可能将根 lifecycle 标记为 completed；审批中断仍保存在 snapshot 或 updates / values 的 `__interrupt__` 中。SDK 没有输出的事件由前端根据原生状态处理。重启服务只恢复查询能力，不执行模型；普通未完成任务显式传 `null`，审批使用 `Command.resume`。
+
+参考：[Event streaming](https://docs.langchain.com/oss/javascript/langchain/event-streaming)、[Checkpointers](https://docs.langchain.com/oss/javascript/langgraph/checkpointers)、[Human-in-the-loop](https://docs.langchain.com/oss/javascript/deepagents/human-in-the-loop)。
 
 ## 执行生命周期与停止
 
-执行服务通过 `execute(id, identity, input, consume)` 持有整个执行作用域。新输入为 `{ text, modelConfigId }`，继续执行传 null，审批为 `{ interruptId, decisions }`。审批沿用保存的执行模型引用，每次恢复创建新的 invocation、调用预算与超时。归属、状态和模型准入仍在每聊天锁内串行进行，锁在准入后释放；其他聊天独立运行，同一聊天的第二次执行返回 409。HTTP 层只在 `consume` 中初始化 SSE、消费 `call.stream(send)` 并关闭响应，不接管一个已登记但尚未启动的调用。即使响应初始化失败，也由执行服务的外层 `finally` 排空工作并释放活跃记录。
+`execute(id, identity, input, modelConfigId, consume)` 完成业务准入后，将 SDK 原生流交给 HTTP 层消费。每会话的短期准入队列协调执行与关闭；活跃记录保护整个 SDK 运行和收尾，另一执行返回 409。
 
-| 所有者             | 职责                                                                                 |
-| ------------------ | ------------------------------------------------------------------------------------ |
-| `AgentInvocation`  | 模型实例、独立预算、取消信号、超时、middleware 工作登记、模型回调登记、排空与 `done` |
-| `execution.ts`     | 归属与准入、活跃槽位、SDK 流与状态投影、执行作用域、停止接收执行并等待准入和活跃调用 |
-| 会话路由           | 输入校验、SSE 响应头与编码、背压、断线通知与响应关闭                                 |
-| Fastify / shutdown | `preClose` 停止执行，等待请求后在 `onClose` 关闭连接池；外层 10 秒硬截止             |
+| 所有者             | 职责                                                              |
+| ------------------ | ----------------------------------------------------------------- |
+| `AgentInvocation`  | 模型、独立预算、取消信号、超时、hooks 与模型回调登记、排空及 done |
+| `execution.ts`     | 归属与准入、模型选择、审批审计、原生流调用、关闭和停止            |
+| 会话路由           | 请求校验、SDK Command 构造、SSE 编码、背压和连接清理              |
+| Fastify / shutdown | 先停止并排空执行，再关闭 HTTP 连接和数据库；进程保留硬截止        |
 
-`callModel` / `callTool` 通过公开 wrap hooks 登记 handler Promise，调用前检查取消信号与预算。模型另外用官方 `handleChatModelStart`、`handleLLMEnd`、`handleLLMError` 按 run ID 登记和解除等待。这两项跟踪不能互相替代：锁定 SDK 的 Agent 模型节点使用 `raceWithSignal`，取消可先结束 handler 的等待，而底层模型稍后才报告结束／错误。工具 handler 在锁定 SDK 中会等待实际工具调用结束。
+调用范围为 `AgentInvocation.run()`：创建 SDK 流，消费事件并等待 `run.output`；输出失败时先取消，再等待 SDK 结束。模型调用和工具工作排空后，释放活跃记录并关闭 HTTP 响应。取消可能先结束 SDK handler 的等待，因此模型生命周期回调仍独立登记底层工作，回调设置 `awaitHandlers = true`，不使用全局 `awaitAllCallbacks()`。
 
-生命周期 callbacks 显式设置 `awaitHandlers = true`，使开始与结束登记不依赖全局后台回调队列的调度。回调只做短小的登记操作，不在开始回调中等待模型完成。不使用 `awaitAllCallbacks()` 作为本次执行的结束条件：它等待全局回调队列，既不隔离聊天，也不代表尚未提交结束回调的模型已经结束。
+客户端断线、超时、预算耗尽和服务停止不关闭会话，能否继续由保存的 snapshot 决定。关闭会话先持久化关闭标记，再取消在途执行；写入失败不发送取消。服务停止时拒绝新准入，取消活跃执行，等待已经开始的准入和 invocation。协作式取消无法结束的工作由进程硬截止处理。
 
-停止顺序为：请求取消 → 消费 SDK 流退出（包含 SDK 已登记的 checkpoint 写入）→ `waitForIdle()` 等待模型与工具工作排空 → 发送结束事件并关闭响应 → 完成本次 invocation 并释放活跃槽位。输出失败时先请求取消，再退出迭代器，避免迭代器关闭等待仍运行的图。计时器覆盖响应收尾期间的背压等待；最终完成通知也包含传输收尾。`run()` 的外层清理负责覆盖传输初始化、消费和收尾抛错的路径，不依赖 `afterAgent` 执行。
+集成测试通过官方 SSE 解码器读取真实 HTTP 输出，覆盖原始事件相等、原文保存、SDK 状态、四种审批决策、混合批量恢复、完整审计重启持久化、模型切换、断线、预算、取消排空和停止竞态。
 
-服务停止先关闭执行准入并通知活跃调用取消，然后等待已经进入准入锁的数据库／checkpoint 操作，最后等待 invocation 完成；准入在所有异步检查后再次检查关闭状态，避免关闭期间启动新 Agent。取消是协作式的，忽略信号且一直不结束的工作会继续占用槽位，进程退出由既有硬截止处理，不提前遗忘仍在运行的工作。
-
-这套作用域归属是本项目的工程约定，官方 SDK 提供 context、wrap hooks、callbacks 和 signal 扩展点，并未提供或要求应用采用同名生命周期类。核心测试覆盖后台回调队列阻塞时的模型排空、排空期间新增工具工作、响应初始化失败、结束输出阻塞、准入与关闭竞态。
-
-参考：[Custom middleware](https://docs.langchain.com/oss/javascript/langchain/middleware/custom)、[BaseCallbackHandler](https://reference.langchain.com/javascript/langchain-core/callbacks/base/BaseCallbackHandler)、[awaitAllCallbacks](https://reference.langchain.com/javascript/langchain-core/callbacks/promises/awaitAllCallbacks)。
+参考：[Custom middleware](https://docs.langchain.com/oss/javascript/langchain/middleware/custom)、[BaseCallbackHandler](https://reference.langchain.com/javascript/langchain-core/callbacks/base/BaseCallbackHandler)。
 
 ## Provider 与应用层的边界
 
@@ -89,7 +95,7 @@ LangGraph 的新输入、错误后继续、审批恢复和历史重放语义不�
 - 用户权限、Provider / ModelConfig 数据表、凭证加密及管理入口。
 - 每次新输入由前端显式指定模型；全局和聊天默认选择均由前端维护，后端不保存默认值。
 - 保存实际模型引用，未完成任务继续使用原配置，凭证可以轮换。
-- 每聊天单个活跃调用、显式继续、无自动 fallback、脱敏 HTTP / SSE 返回。
+- 每聊天单个活跃调用、显式继续、无自动 fallback；HTTP 错误脱敏，SDK 输出原样返回所属用户。
 
 这些规则继续保留；数据库与 API 无需为了 middleware 机制而重做。API 的完整用法见 [模型配置文档](model-configuration.md)。
 

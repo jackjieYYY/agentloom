@@ -60,50 +60,68 @@ pnpm dev
 
 使用本地 API 前先停止 Compose API，避免占用同一个端口或同时执行：`docker compose stop api`。验证生产编译产物可用 `pnpm build && pnpm start`，不需要 TypeScript 运行器。默认监听 `127.0.0.1:3000`；`HOST`、`PORT` 可通过环境变量覆盖。`GET /health` 实际查询 PostgreSQL，成功返回 200，失败返回 503，无需认证。
 
-## 认证、输入与 SSE
+## 认证、原生输入与事件流
 
-可信签发端与服务端共享 `AUTH_JWT_SECRET`，仅允许 HS256，必须包含未过期的 `exp` 和全局唯一的 `sub`，存在 `nbf` 时也会校验。`sub` 为 1–200 字符且不能全为空白。服务没有开发身份绕过；请求体或自定义用户标识 header 不参与身份判断。
+先通过 `POST /auth/register` 注册邮箱和密码，再通过 `POST /auth/login` 获取 `accessToken`。后续请求携带 `Authorization: Bearer <accessToken>`，账号信息通过 `GET /auth/me` 查询，令牌过期后重新登录。所有会话接口均验证账号和资源归属。
 
-本地验证可以用 `.env` 中的服务端密钥生成短期 JWT；不要把该密钥分发给浏览器：
+创建 Provider 和模型后保存返回的 `modelConfigId`。每次新输入在运行地址的 query 中选择模型，请求体直接使用 SDK 的消息形状：
 
 ```sh
 export API_URL=http://127.0.0.1:3000
-export TOKEN="$(node --env-file=.env --input-type=module <<'JS'
-import { SignJWT } from 'jose';
-console.log(await new SignJWT({ sub: 'local-user' })
-  .setProtectedHeader({ alg: 'HS256' })
-  .setExpirationTime('1h')
-  .sign(new TextEncoder().encode(process.env.AUTH_JWT_SECRET)));
-JS
-)"
-```
-
-先按[模型配置文档](docs/model-configuration.md#配置管理-api)创建 provider 和模型，将返回的 `modelConfigId` 保存为 `MODEL_CONFIG_ID`。所有配置管理接口同样要求 JWT；响应不包含 API Key。
-
-```sh
+export TOKEN='替换为登录返回的accessToken'
 export MODEL_CONFIG_ID='替换为modelConfigId'
 curl --fail -X POST "$API_URL/conversations" \
   -H "Authorization: Bearer $TOKEN"
 export CONVERSATION_ID='替换为响应中的conversationId'
 
-curl -N --fail -X POST "$API_URL/conversations/$CONVERSATION_ID/input" \
+curl -N --fail -X POST "$API_URL/conversations/$CONVERSATION_ID/runs?modelConfigId=$MODEL_CONFIG_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"text\":\"请使用 echo 回显 hello\",\"modelConfigId\":\"$MODEL_CONFIG_ID\"}"
+  -d '{"messages":[{"role":"user","content":"请使用 echo 回显 hello"}]}'
 ```
 
-每次新输入都必须提交 `text` 和 `modelConfigId`，后端不保存默认模型，也不会回退上一轮选择。模型是否请求 `echo` 由模型决定。`curl -N` 禁止客户端缓冲；SSE 包括 `message`、`tool`、`awaiting_approval`、`completed`、`error` 和最终 `end`，其中 `end.status` 表示本次调用结束状态。HTTP 已开始返回流后，通过 SSE 的错误及结束事件判断结果。
+新输入只接受一条用户消息。`content` 原样传递和保存，保留首尾空白、缩进、制表符和换行；全空白或超过 32000 字符返回 400。后续新输入自动沿用会话历史，模型必须每次显式选择。
 
-查询读取最新保存的内容，不触发执行，也不证明某次提交已经保存或完成。流中增量可能尚未持久化；断线后先查询，不重放或自动重发输入。查询中的 `active`、`canSubmit`、`canContinue`、`canApprove` 表示当前允许的操作。存在普通未完成任务时可显式继续：
+响应是一次执行的 SSE 流，每个 `data` 直接携带 `streamEvents({ version: 'v3' })` 产生的官方 `ProtocolEvent`，包含 SDK 实际输出的消息、工具、更新、状态、reasoning、元数据和错误。字段、顺序和序号保持 SDK 原值，显示过滤、预览及折叠由前端处理。
+
+前端可以直接使用官方 SSE 解码器：
+
+```ts
+import { BytesLineDecoder, SSEDecoder } from '@langchain/langgraph-sdk/utils';
+
+const response = await fetch(
+  `${apiUrl}/conversations/${conversationId}/runs?modelConfigId=${modelConfigId}`,
+  {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hello' }] }),
+  },
+);
+if (!response.ok) throw new Error(`HTTP ${response.status}`);
+for await (const { data: event } of response
+  .body!.pipeThrough(BytesLineDecoder())
+  .pipeThrough(SSEDecoder())) {
+  renderEvent(event);
+}
+```
+
+`GET /conversations/:id` 直接返回 SDK snapshot，包括 `values`、`next`、`tasks` 和 checkpoint 配置等字段。消息使用 SDK 的 JSON 序列化表示，状态查询不会执行模型。`GET /conversations/:id/metadata` 返回会话记录、`active` 和 `approvalAudit`，用于业务状态和审计展示；会话列表通过 `GET /conversations?limit=20` 查询并使用 `nextCursor` 分页。
+
+一次请求持有完整执行作用域。连接结束后按保存的 snapshot 判断下一步；普通未完成任务传 `null` 显式继续：
 
 ```sh
-curl -N --fail -X POST "$API_URL/conversations/$CONVERSATION_ID/continue" \
-  -H "Authorization: Bearer $TOKEN"
+curl -N --fail -X POST "$API_URL/conversations/$CONVERSATION_ID/runs" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d 'null'
 ```
 
-继续不接受新输入或模型覆盖，使用已保存的执行模型配置 ID 及其当前配置，可能重新执行尚未保存完成的工作。无未完成任务、会话正在执行、等待审批或已关闭时会被拒绝。后续新输入保留历史；所属会话列表通过 `GET /conversations?limit=20` 查询，并可使用返回的 `nextCursor` 分页。
+继续使用保存的执行模型配置 ID 及其当前配置，不接受模型覆盖。无未完成任务、正在执行、等待审批或已关闭时拒绝。每次输入、继续或审批使用独立限额和计时，默认模型调用 10 次、工具调用 20 次、超时 120000 毫秒，通过 `AGENT_MODEL_CALL_LIMIT`、`AGENT_TOOL_CALL_LIMIT`、`AGENT_TIMEOUT_MS` 配置。
 
-每次输入、继续或审批分别使用新的限额和计时，默认模型调用 10 次、工具调用 20 次、活跃超时 120000 毫秒，可通过 `AGENT_MODEL_CALL_LIMIT`、`AGENT_TOOL_CALL_LIMIT`、`AGENT_TIMEOUT_MS` 配置。不自动重试，不承诺跨请求或跨重启的累计预算。超时、上限或活跃断线请求停止当前调用，调用实际结束前不能再执行；这些操作不会关闭会话。
+关闭连接会请求停止本次调用，底层工作排空后释放活跃记录；不会关闭会话。事件只随当前响应发送，重启后从 checkpoint 查询，不自动重放 token 或重发输入。
 
 ## 检查与故障排查
 
@@ -124,56 +142,65 @@ pnpm exec tsx tests/docker.smoke.ts
 - 数据库表不存在：空库尚未初始化。先停止 API，确认允许清空目标库后执行初始化命令；API 不会自动补建 schema。
 - 401：检查 Bearer JWT 的签名、`exp`、`sub`、可选 `nbf` 和服务器时间。404 也可能表示资源属于其他用户。
 - 400：检查请求字段，接口拒绝未知字段。409：先查询会话，按当前状态继续、审批或创建新会话，不盲目重发。
-- 模型配置相关 503：检查 `MODEL_CREDENTIALS_KEY` 是否与录入时一致；不可用模型返回 404。模型和工具错误只提供脱敏摘要，用响应或 SSE 的 `requestId` 关联日志。
-- SSE 没有增量：使用 `curl -N`，检查反向代理缓冲与超时；连接结束后查询已保存状态。待审批正常关流，后续操作见下文。
+- 模型配置相关 503：检查 `MODEL_CREDENTIALS_KEY` 是否与录入时一致；不可用模型返回 404。模型和工具执行错误沿用 SDK 输出，HTTP 响应头的 `x-request-id` 用于关联日志。
+- SSE 没有增量：使用 `curl -N`，检查反向代理缓冲与超时；连接结束后查询 checkpoint 判断完成、待审批或未完成状态。
 
 ## 人工审批
 
-`echo` 工具必须由会话所属用户批准或拒绝。仅允许 `approve`、`reject`，不提供参数编辑或独立审批角色。
+`echo` 工具调用由会话所属用户审查，支持 SDK 的四种决策：
 
-提交新输入后，如果模型请求 `echo`，工具在批准前不会执行。请求返回 `awaiting_approval` SSE，然后以 `end`（`status: awaiting_approval`）正常结束。等待期间没有活跃调用或执行超时，不需要保持连接；普通新输入和 `/continue` 都不能绕过审批。
+| 决策      | 效果                                           | 决策字段                               |
+| --------- | ---------------------------------------------- | -------------------------------------- |
+| `approve` | 使用原始参数执行工具                           | `type`                                 |
+| `edit`    | 使用人工修改后的调用执行工具                   | `type`、`editedAction: { name, args }` |
+| `reject`  | 跳过工具，把拒绝反馈交给模型                   | `type`、可选 `message`                 |
+| `respond` | 跳过工具，把人工回复作为成功的工具结果交给模型 | `type`、`message`                      |
 
-即使没有收到待审批事件，也可以使用所属用户的 JWT 查询：
+配置使用 `interruptOn: { echo: true }`，四种决策均由 SDK 处理。
+
+提交新输入后，模型请求 `echo` 时，SDK 在执行工具前中断并保存 checkpoint。查询 `GET /conversations/:id`，读取 `tasks[].interrupts`：`id` 是中断 ID，`value` 包含原生 `actionRequests` 和 `reviewConfigs`。
+
+`actionRequests[].description` 使用 SDK 默认生成的工具名和完整参数说明，显示截取和折叠由前端处理。工具参数及其他 SDK 输出原样可见。
+
+用原生 `Command.resume` 的中断 ID 映射提交决策：
 
 ```sh
-curl "$API_URL/conversations/$CONVERSATION_ID" \
-  -H "Authorization: Bearer $TOKEN"
+curl -N --fail -X POST "$API_URL/conversations/$CONVERSATION_ID/runs" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"resume":{"替换为当前中断ID":{"decisions":[{"type":"approve"}]}}}'
 ```
 
-响应包含 `awaitingApproval`、`active`、`canApprove`、`approvals` 和 `approvalAudit`。待审批项示例：
+服务端将请求体传给 `new Command(body)`。当前采用单个批量中断，`decisions` 的数量和顺序对应 `actionRequests`；每个调用选择一种决策。例如，四个待审调用可以分别批准、编辑、拒绝和人工回答：
 
 ```json
 {
-  "interruptId": "从当前查询响应获取的中断ID",
-  "decisionStatus": "pending",
-  "actions": [
-    {
-      "toolName": "echo",
-      "argumentSummary": "待回显文本的前200字符",
-      "allowedDecisions": ["approve", "reject"]
+  "resume": {
+    "替换为当前中断ID": {
+      "decisions": [
+        { "type": "approve" },
+        {
+          "type": "edit",
+          "editedAction": {
+            "name": "echo",
+            "args": { "text": "人工修改后的文本" }
+          }
+        },
+        { "type": "reject", "message": "不执行这次调用" },
+        { "type": "respond", "message": "由人工提供的工具结果" }
+      ]
     }
-  ]
+  }
 }
 ```
 
-参数摘要只是预览，不是完整参数。接口不返回完整图状态或 SDK 中断内容。
+批量模式使用 `editedAction`；修改后的工具参数由 SDK 和工具 schema 校验。`respond` 的内容作为成功的工具结果，因此拒绝调用时使用 `reject`。SDK 把结果交给模型继续执行，再次请求受审工具需要新的审批。普通消息和 `null` 不能绕过待审批状态。
 
-用当前中断 ID 提交决策，响应沿用执行 SSE：
+审批沿用保存的执行模型，不接收新输入或模型覆盖，每次恢复使用独立预算。未认证返回 401，其他用户访问返回 404；关闭、活跃、过期中断和重复决策返回 409，非法决策及数量不匹配返回 400。
 
-```sh
-curl -N -X POST "$API_URL/conversations/$CONVERSATION_ID/approvals" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"interruptId":"从当前查询响应复制","decisions":[{"type":"approve"}]}'
-```
+`GET /conversations/:id/metadata` 的 `approvalAudit` 记录中断 ID、完整决策、可信操作者和时间，包含编辑后的工具名与参数、拒绝说明或人工回复。审计在 SDK 恢复前写入，只证明服务已接收决策，不证明工具已执行。写入失败不会恢复。
 
-拒绝时把 `approve` 换成 `reject`。一个中断可能包含多个待审批工具调用，`decisions` 必须与查询中 `actions` 的顺序和数量一一对应；例如 `[{"type":"approve"},{"type":"reject"}]` 表示批准第一个、拒绝第二个。拒绝使当前工具调用不执行，并把拒绝结果交给模型；模型再次请求该工具时需要新的审批。
-
-审批使用该会话已保存的执行模型配置，不接收新输入或模型覆盖。每次审批恢复使用新的模型／工具调用限额和计时。未认证请求返回 401，其他用户访问返回 404；已关闭、正在执行、过期中断以及重复或冲突决策返回 409，非法决策和数量不匹配返回 400。
-
-审批审计只记录会话、中断 ID、决策、可信操作者和时间，可以通过会话查询中的 `approvalAudit` 查看。审计在 SDK 恢复前写入，只证明服务已接收决策，不证明 SDK 已应用决策或工具已执行。审计写入失败时不会恢复执行。
-
-如果进程在审计写入后、SDK 应用决策前中断，同一审批仍待处理时会返回 `decisionStatus: unconfirmed`、`canApprove: false`。再次提交批准或拒绝均返回 409 `Decision outcome unconfirmed`。服务不重发、不补偿；可以继续查询，或取消后创建新会话。
+若审计已经存在但 SDK snapshot 仍保留同一中断，决策结果尚未确认；再次提交返回 409 `Decision outcome unconfirmed`。服务不重发或补偿，可以查询，或关闭会话后另建会话。当前 SDK 的原始流在审批时根 lifecycle 可能为 completed，待审批以原生 snapshot 或更新中的中断信息为准。
 
 ## 等待、重启与取消
 
@@ -188,7 +215,7 @@ curl -X POST "$API_URL/conversations/$CONVERSATION_ID/cancel" \
 
 取消先持久化关闭标记，再通知在途调用停止。响应中的 `active: true` 表示执行仍在收尾；关闭不撤销已发生的工具调用。关闭后禁止输入、继续和审批，已有内容仍可查询。审批与取消共用会话准入锁；关闭之后不再接纳执行。
 
-审批前的正常 SSE 关流不会关闭会话。执行期间断线会请求停止当前调用；重新连接后先查询，不自动重发输入或决策。人工批准不保证有外部副作用的工具只执行一次；当前 `echo` 没有外部副作用。
+执行连接关闭会请求停止当前调用，会话保持开放。重新连接后查询 checkpoint，按保存状态显式继续或审批，不自动重发输入或决策。人工批准不保证有外部副作用的工具只执行一次；当前 `echo` 没有外部副作用。
 
 ## Checkpoint 保留与运维清理
 
