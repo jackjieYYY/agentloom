@@ -205,12 +205,7 @@ it('creates owned conversations and denies other users and guessed IDs', async (
       headers: { authorization },
     });
     expect(owned.statusCode).toBe(200);
-    expect(owned.json()).toMatchObject({
-      ...conversation,
-      messages: [],
-      closedAt: null,
-      active: false,
-    });
+    expect(owned.json()).toMatchObject({ values: {}, next: [], tasks: [] });
 
     for (const claims of [{ sub: userB }]) {
       const denied = await app.inject({
@@ -300,10 +295,9 @@ it('runs compiled ESM, preserves conversations across restarts and exits on SIGT
         );
         expect(queried.status).toBe(200);
         expect(await queried.json()).toMatchObject({
-          ...conversation,
-          messages: [],
-          closedAt: null,
-          active: false,
+          values: {},
+          next: [],
+          tasks: [],
         });
         const started = Date.now();
         child.kill('SIGTERM');

@@ -226,7 +226,7 @@ it('rejects invalid credentials before protected business handlers and rechecks 
       { method: 'GET' as const, url: '/models' },
       {
         method: 'POST' as const,
-        url: `/conversations/${randomUUID()}/input`,
+        url: `/conversations/${randomUUID()}/runs`,
         payload: { text: 'private', modelConfigId: randomUUID() },
       },
     ]) {

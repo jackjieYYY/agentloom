@@ -1,45 +1,65 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { Command } from '@langchain/langgraph';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { and, desc, eq, sql } from 'drizzle-orm';
+import type { Decision } from 'langchain';
 import { z } from 'zod';
 import type { Database } from '../../database/client.js';
 import { conversations } from '../../database/schema.js';
 import { AppError } from '../../runtime/app-error.js';
-import type { Execution, ExecutionCall } from '../../runtime/execution.js';
+import type { Execution } from '../../runtime/execution.js';
 
 const emptyBody = z.strictObject({}).optional();
-const inputBody = z.strictObject({
-  text: z.string().trim().min(1).max(32000),
-  modelConfigId: z.uuid(),
+const messages = z.strictObject({
+  messages: z.tuple([
+    z.strictObject({
+      role: z.literal('user'),
+      content: z.string().max(32000).regex(/\S/),
+    }),
+  ]),
 });
-const approvalBody = z.strictObject({
-  interruptId: z.string().min(1),
-  decisions: z
-    .array(z.strictObject({ type: z.enum(['approve', 'reject']) }))
-    .min(1),
+const decision: z.ZodType<Decision> = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('approve') }),
+  z.strictObject({
+    type: z.literal('edit'),
+    editedAction: z.strictObject({
+      name: z.string(),
+      args: z.record(z.string(), z.unknown()),
+    }),
+  }),
+  z.strictObject({ type: z.literal('reject'), message: z.string().optional() }),
+  z.strictObject({ type: z.literal('respond'), message: z.string() }),
+]);
+const resume = z.strictObject({
+  resume: z
+    .record(
+      z.string().min(1),
+      z.strictObject({
+        decisions: z.array(decision).min(1),
+      }),
+    )
+    .refine((value) => Object.keys(value).length === 1),
 });
+const runRequest = z.union([
+  z.object({
+    body: messages,
+    query: z.strictObject({ modelConfigId: z.uuid() }),
+  }),
+  z.object({ body: resume.nullable(), query: z.strictObject({}) }),
+]);
 const listQuery = z.strictObject({
   cursor: z.uuid().optional(),
-  limit: z
-    .string()
-    .regex(/^\d+$/)
-    .pipe(z.coerce.number<string>().int().min(1).max(100))
-    .default(20),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 const paramsSchema = z.object({ conversationId: z.uuid() });
 
-type ConversationOptions = {
-  database: Database;
-  execution: Execution;
-};
-
+type ConversationOptions = { database: Database; execution: Execution };
 const conversationRoutes: FastifyPluginAsync<ConversationOptions> = async (
   app,
   { database, execution },
 ) => {
   app.addHook('onRequest', app.authenticate);
-
   app.get('/', async (request) => {
     const { cursor, limit } = listQuery.parse(request.query);
     const { userId } = request.identity;
@@ -110,72 +130,49 @@ const conversationRoutes: FastifyPluginAsync<ConversationOptions> = async (
     return execution.cancel(conversationId, request.identity);
   });
 
-  app.post('/:conversationId/input', async (request, reply) => {
+  app.get('/:conversationId/metadata', async (request, reply) =>
+    execution.metadata(id(request, reply), request.identity),
+  );
+  app.post('/:conversationId/runs', async (request, reply) => {
     const conversationId = id(request, reply);
-    const input = inputBody.parse(request.body);
-    return execution.execute(conversationId, request.identity, input, (call) =>
-      stream(request, reply, call),
-    );
-  });
-
-  app.post('/:conversationId/continue', async (request, reply) => {
-    const conversationId = id(request, reply);
-    emptyBody.parse(request.body);
-    return execution.execute(conversationId, request.identity, null, (call) =>
-      stream(request, reply, call),
-    );
-  });
-
-  app.post('/:conversationId/approvals', async (request, reply) => {
-    const conversationId = id(request, reply);
-    const decision = approvalBody.parse(request.body);
-    return execution.execute(
-      conversationId,
-      request.identity,
-      decision,
-      (call) => stream(request, reply, call),
-    );
-  });
-
-  async function stream(
-    request: FastifyRequest,
-    reply: FastifyReply,
-    call: ExecutionCall,
-  ) {
-    const disconnect = () => {
-      if (!reply.raw.writableEnded) call.abort();
-    };
-    reply.raw.on('close', disconnect);
+    const { body, query } = runRequest.parse({
+      body: request.body ?? null,
+      query: request.query,
+    });
     try {
-      reply.hijack();
-      if (reply.raw.destroyed) call.abort();
-      else {
-        reply.raw.writeHead(200, {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache',
-          'x-accel-buffering': 'no',
-          'x-request-id': request.id,
-        });
-        reply.raw.flushHeaders();
-      }
-      await call.stream(async (event, data) => {
-        if (reply.raw.destroyed) return;
-        const writable = reply.raw.write(
-          `event: ${event}\ndata: ${JSON.stringify({ ...data, requestId: request.id })}\n\n`,
-        );
-        if (!writable)
-          await once(reply.raw, 'drain', { signal: call.signal }).catch(
-            (error: unknown) => {
-              if (!call.signal.aborted) throw error;
-            },
-          );
-      });
+      await execution.execute(
+        conversationId,
+        request.identity,
+        body && 'resume' in body ? new Command(body) : body,
+        'modelConfigId' in query ? query.modelConfigId : undefined,
+        async (run, invocation) => {
+          const disconnect = () => invocation.abort();
+          reply.raw.once('close', disconnect);
+          try {
+            reply.hijack();
+            if (reply.raw.destroyed) invocation.abort();
+            else
+              reply.raw.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-cache',
+                'x-accel-buffering': 'no',
+                'x-request-id': request.id,
+              });
+            for await (const event of run) {
+              if (!reply.raw.write('data: ' + JSON.stringify(event) + '\n\n'))
+                await once(reply.raw, 'drain', { signal: invocation.signal });
+            }
+          } finally {
+            reply.raw.off('close', disconnect);
+          }
+        },
+      );
+    } catch (error) {
+      if (!reply.sent) throw error;
     } finally {
-      reply.raw.off('close', disconnect);
-      reply.raw.end();
+      if (reply.sent) reply.raw.end();
     }
     return reply;
-  }
+  });
 };
-
 export default conversationRoutes;

@@ -16,7 +16,6 @@ export async function availableModel(database: Database, id: string) {
       id: modelConfigs.id,
       modelName: modelConfigs.modelName,
       providerId: modelProviders.id,
-      providerName: modelProviders.name,
       type: modelProviders.type,
       baseUrl: modelProviders.baseUrl,
       apiKeyEncrypted: modelProviders.apiKeyEncrypted,
