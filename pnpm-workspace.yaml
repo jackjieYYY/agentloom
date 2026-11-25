@@ -1,2 +1,6 @@
 allowBuilds:
+  cbor-extract: false
   esbuild: true
+  protobufjs: false
+overrides:
+  deepagents>langsmith: 0.9.0

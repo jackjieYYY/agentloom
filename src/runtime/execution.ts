@@ -9,6 +9,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import type { HITLRequest, HITLResponse } from 'langchain';
 import { createConversationAgent, type AgentContext } from '../agents/agent.js';
 import { AgentInvocation } from '../agents/invocation.js';
+import { createModalWorkspace } from '../agents/modal.js';
 import type { Config } from '../config/env.js';
 import type { Database } from '../database/client.js';
 import { approvalAudits, conversations } from '../database/schema.js';
@@ -96,7 +97,7 @@ export function createExecution(
       const decision = isCommand(input)
         ? Object.entries(input.resume as Record<string, HITLResponse>)[0]
         : undefined;
-      const invocation = await locked(id, async () => {
+      const { invocation, workspace } = await locked(id, async () => {
         const row = await owned(id, identity);
         if (closing) throw new AppError(503, 'Server stopping');
         if (row.closedAt) throw new AppError(409, 'Conversation closed');
@@ -136,46 +137,71 @@ export function createExecution(
         );
         const model =
           injectedModel ?? (await configuredModel(selected, config));
-        if (fresh)
-          await database.db
-            .update(conversations)
-            .set({ lastExecutionModelConfigId: selected.id })
-            .where(eq(conversations.id, id));
-        if (closing) throw new AppError(503, 'Server stopping');
-        if (decision) {
-          const [interruptId, response] = decision;
-          await database.db.insert(approvalAudits).values({
-            conversationId: id,
-            interruptId,
-            decisions: response.decisions,
-            userId: identity.userId,
-          });
+        const workspace = config.MODAL_TOKEN_ID
+          ? await createModalWorkspace(id, config.AGENT_TIMEOUT_MS + 30_000)
+          : undefined;
+        try {
           if (closing) throw new AppError(503, 'Server stopping');
+          if (fresh)
+            await database.db
+              .update(conversations)
+              .set({ lastExecutionModelConfigId: selected.id })
+              .where(eq(conversations.id, id));
+          if (closing) throw new AppError(503, 'Server stopping');
+          if (decision) {
+            const [interruptId, response] = decision;
+            await database.db.insert(approvalAudits).values({
+              conversationId: id,
+              interruptId,
+              decisions: response.decisions,
+              userId: identity.userId,
+            });
+            if (closing) throw new AppError(503, 'Server stopping');
+          }
+          const invocation = new AgentInvocation(model, {
+            model: config.AGENT_MODEL_CALL_LIMIT,
+            tool: config.AGENT_TOOL_CALL_LIMIT,
+          });
+          active.set(id, invocation);
+          return { invocation, workspace };
+        } catch (error) {
+          await workspace?.close();
+          throw error;
         }
-        const invocation = new AgentInvocation(model, {
-          model: config.AGENT_MODEL_CALL_LIMIT,
-          tool: config.AGENT_TOOL_CALL_LIMIT,
-        });
-        active.set(id, invocation);
-        return invocation;
       });
       try {
         await invocation.run(config.AGENT_TIMEOUT_MS, async () => {
-          const run = await agent.streamEvents(input, {
-            version: 'v3',
-            configurable: { thread_id: id },
-            context: { ...identity, invocation },
-            signal: invocation.signal,
-            callbacks: [invocation.callbacks],
-            durability: 'sync',
+          const closeSandbox = () => void workspace?.close();
+          invocation.signal.addEventListener('abort', closeSandbox, {
+            once: true,
           });
           try {
-            await consume(run, invocation);
-            await run.output;
-          } catch (error) {
-            invocation.abort();
-            await run.output.catch(() => {});
-            throw error;
+            invocation.signal.throwIfAborted();
+            const runAgent = workspace
+              ? createConversationAgent({
+                  checkpointer: database.saver,
+                  backend: workspace.backend,
+                })
+              : agent;
+            const run = await runAgent.streamEvents(input, {
+              version: 'v3',
+              configurable: { thread_id: id },
+              context: { ...identity, invocation },
+              signal: invocation.signal,
+              callbacks: [invocation.callbacks],
+              durability: 'sync',
+            });
+            try {
+              await consume(run, invocation);
+              await run.output;
+            } catch (error) {
+              invocation.abort();
+              await run.output.catch(() => {});
+              throw error;
+            }
+          } finally {
+            invocation.signal.removeEventListener('abort', closeSandbox);
+            await workspace?.close();
           }
         });
       } finally {

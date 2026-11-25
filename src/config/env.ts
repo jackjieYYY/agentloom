@@ -20,6 +20,8 @@ const environmentSchema = databaseSchema.extend({
   AGENT_TOOL_CALL_LIMIT: z.coerce.number().int().min(1).default(20),
   AGENT_TIMEOUT_MS: z.coerce.number().int().min(1).max(3600000).default(120000),
   AUTH_JWT_SECRET: z.string().min(32).regex(/\S/),
+  MODAL_TOKEN_ID: z.string().min(1).optional(),
+  MODAL_TOKEN_SECRET: z.string().min(1).optional(),
 });
 
 export type Config = z.infer<typeof environmentSchema>;

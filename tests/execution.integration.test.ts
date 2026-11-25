@@ -1,4 +1,5 @@
 import 'tsx';
+import { ModalSandbox } from '@langchain/modal';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   Command,
@@ -7,6 +8,15 @@ import {
 } from '@langchain/langgraph';
 import { BytesLineDecoder, SSEDecoder } from '@langchain/langgraph-sdk/utils';
 import type { Decision } from 'langchain';
+import {
+  App,
+  AppService,
+  ModalClient,
+  Sandbox,
+  SandboxService,
+  Volume,
+  VolumeService,
+} from 'modal';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createApp } from './app.js';
 import { parseConfig } from '../src/config/env.js';
@@ -117,6 +127,68 @@ function gate() {
     },
   };
 }
+
+it('executes in Modal with a persistent conversation volume and terminates each run', async () => {
+  vi.stubEnv('MODAL_TOKEN_ID', 'test-modal-token');
+  vi.stubEnv('MODAL_TOKEN_SECRET', 'test-modal-secret');
+  const client = new ModalClient();
+  const sandbox = new Sandbox(client, 'sb-test');
+  const terminate = vi.spyOn(sandbox, 'terminate').mockResolvedValue(0);
+  vi.spyOn(AppService.prototype, 'fromName').mockResolvedValue(
+    new App('ap-test'),
+  );
+  const volume = new Volume('vo-test');
+  const findVolume = vi
+    .spyOn(VolumeService.prototype, 'fromName')
+    .mockResolvedValue(volume);
+  const create = vi
+    .spyOn(SandboxService.prototype, 'create')
+    .mockResolvedValue(sandbox);
+  const command = vi
+    .spyOn(ModalSandbox.prototype, 'execute')
+    .mockResolvedValue({
+      output: 'sandbox output',
+      exitCode: 0,
+      truncated: false,
+    });
+  try {
+    const model = new ScriptedModel([
+      callTool('execute', { command: 'pwd' }),
+      new AIMessage('finished'),
+      new AIMessage('follow up'),
+    ]);
+    const fixture = await setup(model, {
+      MODAL_TOKEN_ID: process.env.MODAL_TOKEN_ID,
+      MODAL_TOKEN_SECRET: process.env.MODAL_TOKEN_SECRET,
+    });
+    expect((await fixture.input('use shell')).statusCode).toBe(200);
+    expect(command).toHaveBeenCalledWith('pwd');
+    const snapshot = (await fixture.query()).json();
+    expect(JSON.stringify(snapshot.values.messages)).toContain(
+      'sandbox output',
+    );
+    expect((await fixture.input('continue')).statusCode).toBe(200);
+    const volumeName = `agentloom-${fixture.id}`;
+    expect(findVolume.mock.calls).toEqual([
+      [volumeName, { createIfMissing: true }],
+      [volumeName, { createIfMissing: false }],
+      [volumeName, { createIfMissing: true }],
+      [volumeName, { createIfMissing: false }],
+    ]);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[0]?.[2]).toMatchObject({
+      workdir: '/workspace',
+      volumes: { '/workspace': volume },
+    });
+    expect(terminate.mock.calls).toEqual([[{ wait: true }], [{ wait: true }]]);
+
+    create.mockRejectedValueOnce(new Error('sandbox creation failed'));
+    expect((await fixture.input('unavailable sandbox')).statusCode).toBe(503);
+  } finally {
+    client.close();
+    vi.unstubAllEnvs();
+  }
+});
 
 it('passes native input unchanged and sends SDK events and snapshots without projection', async () => {
   const emitted: unknown[] = [];
