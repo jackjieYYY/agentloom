@@ -56,11 +56,37 @@ export class ScriptedModel extends BaseChatModel {
     yield new ChatGenerationChunk({
       message: new AIMessageChunk({
         content: message.content,
-        tool_calls: message.tool_calls,
+        response_metadata: message.response_metadata,
+        tool_call_chunks: (message.tool_calls ?? []).map((call, index) => ({
+          type: 'tool_call_chunk',
+          id: call.id,
+          index,
+          name: call.name,
+          args: JSON.stringify(call.args),
+        })),
       }),
       text: message.text,
     });
   }
+}
+
+export function startInput({
+  text,
+  modelConfigId,
+  ...extra
+}: Record<string, unknown> & { modelConfigId?: string }) {
+  return {
+    query: modelConfigId === undefined ? undefined : { modelConfigId },
+    payload: { messages: [{ role: 'user', content: text }], ...extra },
+  };
+}
+
+export function resumeInput({
+  interruptId,
+  decisions,
+  ...extra
+}: Record<string, unknown>) {
+  return { resume: { [String(interruptId)]: { decisions } }, ...extra };
 }
 
 export function callTool(

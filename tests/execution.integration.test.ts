@@ -1,11 +1,22 @@
 import 'tsx';
+import { ModalSandbox } from '@langchain/modal';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
-  AIMessage,
-  isToolMessage,
-  type BaseMessage,
-} from '@langchain/core/messages';
-import type { BaseChatModelCallOptions } from '@langchain/core/language_models/chat_models';
-import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+  Command,
+  GraphRunStream,
+  type ProtocolEvent,
+} from '@langchain/langgraph';
+import { BytesLineDecoder, SSEDecoder } from '@langchain/langgraph-sdk/utils';
+import type { Decision } from 'langchain';
+import {
+  App,
+  AppService,
+  ModalClient,
+  Sandbox,
+  SandboxService,
+  Volume,
+  VolumeService,
+} from 'modal';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createApp } from './app.js';
 import { parseConfig } from '../src/config/env.js';
@@ -15,7 +26,7 @@ import { approvalAudits, modelConfigs } from '../src/database/schema.js';
 import { createExecution } from '../src/runtime/execution.js';
 import { createProvider, createModel } from '../src/models/manage.js';
 import { jwtFixture, prepareUsers, userA, userB } from './auth-helpers.js';
-import { callTool, ScriptedModel } from './helpers.js';
+import { callTool, ScriptedModel, startInput, resumeInput } from './helpers.js';
 
 const url = process.env.TEST_DATABASE_URL;
 if (!url)
@@ -26,14 +37,10 @@ const apps: ReturnType<typeof createApp>[] = [];
 const releases: (() => void)[] = [];
 afterEach(async () => {
   for (const release of releases.splice(0)) release();
-  vi.useRealTimers();
+  vi.restoreAllMocks();
   await Promise.all(apps.splice(0).map((app) => app.close()));
 });
-
-async function setup(
-  model: ScriptedModel | undefined,
-  overrides: NodeJS.ProcessEnv = {},
-) {
+async function setup(model: ScriptedModel, overrides: NodeJS.ProcessEnv = {}) {
   const fixture = jwtFixture();
   const config = parseConfig({
     DATABASE_URL: url,
@@ -43,19 +50,15 @@ async function setup(
   await initializeDatabase(url!);
   const database = createDatabase(url!);
   await prepareUsers(database);
-  let modelConfigId: string | undefined;
-  if (model) {
-    const provider = await createProvider(
-      database,
-      { name: 'test', type: 'openai', apiKey: 'test-only-key' },
-      'ab'.repeat(32),
-    );
-    const selected = await createModel(database, {
-      providerId: provider.providerId,
-      modelName: 'gpt-4.1-mini',
-    });
-    modelConfigId = selected.modelConfigId;
-  }
+  const provider = await createProvider(
+    database,
+    { name: 'test', type: 'openai', apiKey: 'test-only-key' },
+    'ab'.repeat(32),
+  );
+  const selected = await createModel(database, {
+    providerId: provider.providerId,
+    modelName: 'gpt-4.1-mini',
+  });
   const app = createApp(database, config, model);
   apps.push(app);
   const headers = { authorization: `Bearer ${await fixture.sign()}` };
@@ -67,14 +70,27 @@ async function setup(
   expect(created.statusCode).toBe(201);
   const id: string = created.json().conversationId;
   const path = `/conversations/${id}`;
-  const post = (action: string, payload?: Record<string, unknown>) =>
+  const modelConfigId = selected.modelConfigId;
+  const input = (text: string) =>
     app.inject({
       method: 'POST',
-      url: `${path}/${action}`,
+      url: `${path}/runs`,
       headers,
-      payload: action === 'input' ? { modelConfigId, ...payload } : payload,
+      ...startInput({ text, modelConfigId }),
     });
+  const resume = (interruptId: string, decisions: Decision[]) =>
+    app.inject({
+      method: 'POST',
+      url: `${path}/runs`,
+      headers,
+      payload: resumeInput({ interruptId, decisions }),
+    });
+  const next = () =>
+    app.inject({ method: 'POST', url: `${path}/runs`, headers });
   const query = () => app.inject({ url: path, headers });
+  const metadata = () => app.inject({ url: `${path}/metadata`, headers });
+  const cancel = () =>
+    app.inject({ method: 'POST', url: `${path}/cancel`, headers });
   return {
     app,
     database,
@@ -83,223 +99,284 @@ async function setup(
     headers,
     id,
     path,
-    post,
-    query,
     modelConfigId,
+    input,
+    resume,
+    next,
+    query,
+    metadata,
+    cancel,
   };
 }
-
 function gate() {
   const entered = Promise.withResolvers<void>();
   const finished = Promise.withResolvers<AIMessage>();
+  const aborted = Promise.withResolvers<void>();
   const release = () => finished.resolve(new AIMessage('unblocked'));
   releases.push(release);
   return {
     entered: entered.promise,
+    aborted: aborted.promise,
     release,
-    response: async () => {
+    response: async (options: { signal?: AbortSignal }) => {
+      options.signal?.addEventListener('abort', () => aborted.resolve(), {
+        once: true,
+      });
       entered.resolve();
       return finished.promise;
     },
   };
 }
 
-it('streams tools, messages and completion, retains history and isolates conversations', async () => {
+it('executes in Modal with a persistent conversation volume and terminates each run', async () => {
+  vi.stubEnv('MODAL_TOKEN_ID', 'test-modal-token');
+  vi.stubEnv('MODAL_TOKEN_SECRET', 'test-modal-secret');
+  const client = new ModalClient();
+  const sandbox = new Sandbox(client, 'sb-test');
+  const terminate = vi.spyOn(sandbox, 'terminate').mockResolvedValue(0);
+  vi.spyOn(AppService.prototype, 'fromName').mockResolvedValue(
+    new App('ap-test'),
+  );
+  const volume = new Volume('vo-test');
+  const findVolume = vi
+    .spyOn(VolumeService.prototype, 'fromName')
+    .mockResolvedValue(volume);
+  const create = vi
+    .spyOn(SandboxService.prototype, 'create')
+    .mockResolvedValue(sandbox);
+  const command = vi
+    .spyOn(ModalSandbox.prototype, 'execute')
+    .mockResolvedValue({
+      output: 'sandbox output',
+      exitCode: 0,
+      truncated: false,
+    });
+  try {
+    const model = new ScriptedModel([
+      callTool('execute', { command: 'pwd' }),
+      new AIMessage('finished'),
+      new AIMessage('follow up'),
+    ]);
+    const fixture = await setup(model, {
+      MODAL_TOKEN_ID: process.env.MODAL_TOKEN_ID,
+      MODAL_TOKEN_SECRET: process.env.MODAL_TOKEN_SECRET,
+    });
+    expect((await fixture.input('use shell')).statusCode).toBe(200);
+    expect(command).toHaveBeenCalledWith('pwd');
+    const snapshot = (await fixture.query()).json();
+    expect(JSON.stringify(snapshot.values.messages)).toContain(
+      'sandbox output',
+    );
+    expect((await fixture.input('continue')).statusCode).toBe(200);
+    const volumeName = `agentloom-${fixture.id}`;
+    expect(findVolume.mock.calls).toEqual([
+      [volumeName, { createIfMissing: true }],
+      [volumeName, { createIfMissing: false }],
+      [volumeName, { createIfMissing: true }],
+      [volumeName, { createIfMissing: false }],
+    ]);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[0]?.[2]).toMatchObject({
+      workdir: '/workspace',
+      volumes: { '/workspace': volume },
+    });
+    expect(terminate.mock.calls).toEqual([[{ wait: true }], [{ wait: true }]]);
+
+    create.mockRejectedValueOnce(new Error('sandbox creation failed'));
+    expect((await fixture.input('unavailable sandbox')).statusCode).toBe(503);
+  } finally {
+    client.close();
+    vi.unstubAllEnvs();
+  }
+});
+
+it('passes native input unchanged and sends SDK events and snapshots without projection', async () => {
+  const emitted: unknown[] = [];
+  const iterate = GraphRunStream.prototype[Symbol.asyncIterator];
+  vi.spyOn(GraphRunStream.prototype, Symbol.asyncIterator).mockImplementation(
+    async function* (this: GraphRunStream) {
+      for await (const event of {
+        [Symbol.asyncIterator]: () => iterate.call(this),
+      }) {
+        emitted.push(JSON.parse(JSON.stringify(event)));
+        yield event;
+      }
+    },
+  );
+  const text = '  original\tinput\r\n\n';
   const model = new ScriptedModel([
-    callTool('write_todos', {
-      todos: [{ content: 'safe task', status: 'completed' }],
-    }),
     new AIMessage({
       content: [
-        { type: 'reasoning', reasoning: 'private reasoning' },
-        { type: 'text', text: 'first answer' },
+        { type: 'reasoning', reasoning: 'model reasoning' },
+        { type: 'text', text: 'answer' },
       ],
+      response_metadata: { providerMarker: 'model metadata' },
     }),
-    new AIMessage('follow-up answer'),
-    new AIMessage('isolated'),
   ]);
   const f = await setup(model);
-  expect((await f.post('continue')).json().error).toBe('No unfinished work');
-  const first = await f.post('input', { text: 'first input' });
-  expect(first.statusCode).toBe(200);
-  expect(first.headers['content-type']).toContain('text/event-stream');
-  expect(first.body).toContain('event: message');
-  expect(first.body).toContain('first answer');
-  expect(first.body).toContain('"status":"requested"');
-  expect(first.body).toContain('"status":"finished"');
-  expect(first.body).toContain('event: completed');
-  expect(first.body).toContain('event: end');
-  expect(first.body).not.toContain('safe echo');
-  expect(first.body).not.toContain('private reasoning');
-  expect(first.body).not.toContain(userA);
-  expect((await f.post('input', { text: 'follow up' })).body).toContain(
-    'follow-up answer',
+  const response = await f.input(text);
+  expect(response.statusCode).toBe(200);
+  expect(response.headers['content-type']).toContain('text/event-stream');
+  const frames = await Array.fromAsync(
+    new Response(response.body)
+      .body!.pipeThrough(BytesLineDecoder())
+      .pipeThrough(SSEDecoder()),
   );
-  const state = (await f.query()).json();
-  expect(JSON.stringify(state)).not.toContain('private reasoning');
-  expect(state).toMatchObject({
+  const events = frames.map(({ data }) => data as ProtocolEvent);
+  expect(events).toEqual(emitted);
+  expect(events.length).toBeGreaterThan(1);
+  expect(
+    events.every(
+      (data) =>
+        data.type === 'event' &&
+        typeof data.seq === 'number' &&
+        Array.isArray(data.params.namespace),
+    ),
+  ).toBe(true);
+  expect(events.some((data) => data.method === 'updates')).toBe(true);
+  expect(events.some((data) => data.method === 'values')).toBe(true);
+  expect(response.body).toContain('model reasoning');
+  expect(response.body).not.toContain('event_id');
+  expect(response.body).not.toContain('input.requested');
+  expect(
+    model.seen[0]
+      .filter(HumanMessage.isInstance)
+      .map((message) => message.text),
+  ).toEqual([text]);
+  const snapshot = (await f.query()).json();
+  expect(snapshot).toHaveProperty('config.configurable.thread_id', f.id);
+  expect(snapshot).toHaveProperty('metadata');
+  expect(snapshot.next).toEqual([]);
+  expect(JSON.stringify(snapshot.values.messages)).toContain(
+    JSON.stringify(text).slice(1, -1),
+  );
+  expect(JSON.stringify(snapshot)).toContain('model reasoning');
+  expect(snapshot).not.toHaveProperty('canSubmit');
+  expect((await f.metadata()).json()).toMatchObject({
     active: false,
-    unfinished: false,
-    closedAt: null,
-    canSubmit: true,
-    canContinue: false,
+    lastExecutionModelConfigId: f.modelConfigId,
   });
-  expect(
-    state.messages.map((message: { content: string }) => message.content),
-  ).toEqual(['first input', 'first answer', 'follow up', 'follow-up answer']);
-  const calls = model.seen.length;
-  await f.query();
-  expect(model.seen).toHaveLength(calls);
-  const other = await f.app.inject({
-    method: 'POST',
-    url: '/conversations',
-    headers: f.headers,
-  });
-  const otherPath = `/conversations/${other.json().conversationId}`;
-  expect(
-    (await f.app.inject({ url: otherPath, headers: f.headers })).json()
-      .messages,
-  ).toEqual([]);
-  await f.app.inject({
-    method: 'POST',
-    url: `${otherPath}/input`,
-    headers: f.headers,
-    payload: { text: 'other input', modelConfigId: f.modelConfigId },
-  });
-  expect(
-    model.seen.at(-1)?.some((message) => message.content === 'first input'),
-  ).toBe(false);
 });
 
-it('authorizes every execution, read and cancel operation and validates request bodies', async () => {
-  const model = new ScriptedModel([]);
-  const f = await setup(model);
-  for (const action of ['', '/input', '/continue', '/cancel', '/approvals']) {
-    for (const claims of [undefined, { sub: userB }]) {
+it('requires ownership on every native execution, state, metadata and cancellation request', async () => {
+  const f = await setup(new ScriptedModel([]));
+  for (const [suffix, method] of [
+    ['', 'GET'],
+    ['/metadata', 'GET'],
+    ['/runs', 'POST'],
+    ['/cancel', 'POST'],
+  ] as const) {
+    for (const other of [false, true]) {
+      const headers = other
+        ? { authorization: `Bearer ${await f.fixture.sign({ sub: userB })}` }
+        : {};
       const response = await f.app.inject({
-        method: action ? 'POST' : 'GET',
-        url: `${f.path}${action}`,
-        headers: claims
-          ? { authorization: `Bearer ${await f.fixture.sign(claims)}` }
-          : {},
-        ...(action === '/input'
-          ? { payload: { text: 'private', modelConfigId: f.modelConfigId } }
-          : action === '/approvals'
-            ? {
-                payload: {
-                  interruptId: 'unknown',
-                  decisions: [{ type: 'approve' }],
-                },
-              }
-            : {}),
+        method,
+        url: `${f.path}${suffix}`,
+        headers,
       });
-      expect(response.statusCode).toBe(claims ? 404 : 401);
+      expect(response.statusCode).toBe(other ? 404 : 401);
     }
   }
-  for (const payload of [
-    { text: 'missing model', modelConfigId: undefined },
-    { text: 'null model', modelConfigId: null },
-    { text: 'invalid model', modelConfigId: 'invalid' },
-    { text: '' },
-    { text: '   ' },
-    { text: 'ok', userId: 'forged' },
-    { messages: [] },
-    { text: 'x'.repeat(32001) },
-  ]) {
-    expect((await f.post('input', payload)).statusCode).toBe(400);
-  }
-  for (const action of ['continue', 'cancel'])
-    expect((await f.post(action, { text: 'forged' })).statusCode).toBe(400);
-  for (const payload of [
-    {},
-    { interruptId: '', decisions: [{ type: 'approve' }] },
-    { interruptId: 'unknown', decisions: [] },
-    { interruptId: 'unknown', decisions: [{ type: 'edit' }] },
-    { interruptId: 'unknown', decisions: [{ type: 'respond' }] },
-    {
-      interruptId: 'unknown',
-      decisions: [{ type: 'reject', message: 'extra' }],
-    },
-    {
-      interruptId: 'unknown',
-      decisions: [{ type: 'approve' }],
-      userId: 'forged',
-    },
-    {
-      interruptId: 'unknown',
-      decisions: [{ type: 'approve' }],
-      modelConfigId: f.modelConfigId,
-    },
-  ])
-    expect((await f.post('approvals', payload)).statusCode).toBe(400);
-  expect(
-    (
-      await f.app.inject({
-        method: 'POST',
-        url: '/conversations',
-        headers: f.headers,
-        payload: { modelConfigId: f.modelConfigId },
-      })
-    ).statusCode,
-  ).toBe(400);
-  expect(
-    (
-      await f.app.inject({
-        method: 'PATCH',
-        url: f.path,
-        headers: f.headers,
-        payload: { modelConfigId: f.modelConfigId },
-      })
-    ).statusCode,
-  ).toBe(404);
-  expect(model.seen).toHaveLength(0);
-  expect((await f.query()).json().closedAt).toBeNull();
 });
 
-it('does not retry model failures, exposes only safe saved state and continues after restart with null', async () => {
-  const failed = new ScriptedModel([
-    new Error('private-api-key-and-tool-result'),
-  ]);
-  const f = await setup(failed);
-  const response = await f.post('input', { text: 'persist before failure' });
-  expect(response.body).toContain('event: error');
-  expect(response.body).not.toContain('private-api-key');
-  expect(failed.seen).toHaveLength(1);
-  const state = (await f.query()).json();
-  expect(state).toMatchObject({
-    unfinished: true,
-    canContinue: true,
-    error: 'Execution failed',
-  });
-  expect(JSON.stringify(state)).not.toContain('private-api-key');
-  expect((await f.post('input', { text: 'must not merge' })).statusCode).toBe(
-    409,
-  );
+it('validates the HTTP input boundary without trimming user content', async () => {
+  const f = await setup(new ScriptedModel([]));
+  for (const content of ['', ' \t\n ', 'x'.repeat(32001)]) {
+    expect((await f.input(content)).statusCode).toBe(400);
+  }
+  for (const options of [
+    { payload: { messages: [{ role: 'user', content: 'missing model' }] } },
+    {
+      query: { modelConfigId: 'invalid' },
+      payload: { messages: [{ role: 'user', content: 'invalid model' }] },
+    },
+    { query: { modelConfigId: f.modelConfigId } },
+    {
+      query: { modelConfigId: f.modelConfigId },
+      payload: { messages: [{ role: 'system', content: 'forged' }] },
+    },
+    {
+      query: { modelConfigId: f.modelConfigId },
+      payload: {
+        messages: [{ role: 'user', content: 'forged' }],
+        userId: userB,
+      },
+    },
+    { payload: { resume: { missing: { decisions: [{ type: 'edit' }] } } } },
+    {
+      payload: {
+        resume: {
+          missing: {
+            decisions: [
+              { type: 'edit', editedAction: { name: 'echo', args: [] } },
+            ],
+          },
+        },
+      },
+    },
+    { payload: { resume: { missing: { decisions: [{ type: 'respond' }] } } } },
+    {
+      payload: {
+        resume: { missing: { decisions: [{ type: 'respond', message: 42 }] } },
+      },
+    },
+    {
+      payload: {
+        resume: { missing: { decisions: [{ type: 'reject', message: 42 }] } },
+      },
+    },
+    { payload: { resume: {} } },
+    { payload: { resume: { first: { decisions: [] } } } },
+  ])
+    expect(
+      (
+        await f.app.inject({
+          method: 'POST',
+          url: `${f.path}/runs`,
+          headers: f.headers,
+          ...options,
+        })
+      ).statusCode,
+    ).toBe(400);
+});
+
+it('retains exact checkpoints across failure and restart and only resumes explicitly', async () => {
+  const text = ' \tpersist\r\n\n';
+  const f = await setup(new ScriptedModel([new Error('native model error')]));
+  expect((await f.input(text)).body).toContain('native model error');
+  const snapshot = (await f.query()).json();
+  expect(snapshot.next.length).toBeGreaterThan(0);
+  expect(
+    snapshot.tasks.some(
+      (task: { error?: unknown }) => task.error !== undefined,
+    ),
+  ).toBe(true);
+  expect((await f.input('cannot bypass')).statusCode).toBe(409);
   await f.app.close();
-  const db = createDatabase(url!);
   const model = new ScriptedModel([new AIMessage('recovered')]);
-  const app = createApp(db, f.config, model);
+  const app = createApp(createDatabase(url!), f.config, model);
   apps.push(app);
   expect(
-    (await app.inject({ url: f.path, headers: f.headers })).json().canContinue,
-  ).toBe(true);
+    (await app.inject({ url: f.path, headers: f.headers })).statusCode,
+  ).toBe(200);
   expect(model.seen).toHaveLength(0);
   const resumed = await app.inject({
     method: 'POST',
-    url: `${f.path}/continue`,
+    url: `${f.path}/runs`,
     headers: f.headers,
   });
   expect(resumed.body).toContain('recovered');
   expect(
     model.seen[0]
-      .filter((message) => message.getType() === 'human')
-      .map((message) => message.content),
-  ).toEqual(['persist before failure']);
+      .filter(HumanMessage.isInstance)
+      .map((message) => message.text),
+  ).toEqual([text]);
   expect(
     (
       await app.inject({
         method: 'POST',
-        url: `${f.path}/continue`,
+        url: `${f.path}/runs`,
         headers: f.headers,
       })
     ).statusCode,
@@ -307,7 +384,7 @@ it('does not retry model failures, exposes only safe saved state and continues a
 });
 
 it.each(['model', 'tool'])(
-  'bounds %s calls and grants a fresh budget on explicit continuation',
+  'enforces %s limits with fresh continuation budgets',
   async (kind) => {
     const model = new ScriptedModel(
       kind === 'model'
@@ -322,790 +399,420 @@ it.each(['model', 'tool'])(
       [kind === 'model' ? 'AGENT_MODEL_CALL_LIMIT' : 'AGENT_TOOL_CALL_LIMIT']:
         '1',
     });
-    const first = await f.post('input', { text: 'limited' });
-    expect(first.body).toContain('event: error');
-    expect(model.seen).toHaveLength(kind === 'model' ? 1 : 2);
-    expect(first.body.match(/"status":"finished"/g) ?? []).toHaveLength(1);
-    expect((await f.query()).json().canContinue).toBe(true);
-    const resumed = await f.post('continue');
-    expect(resumed.body).toContain('event: completed');
-    expect(model.seen).toHaveLength(kind === 'model' ? 2 : 3);
-    expect((await f.query()).json().unfinished).toBe(false);
+    expect((await f.input('limited')).body).toContain('call limit reached');
+    expect((await f.query()).json().next.length).toBeGreaterThan(0);
+    expect((await f.input('bypass')).statusCode).toBe(409);
+    expect((await f.next()).body).toContain('finished');
   },
 );
 
-it('keeps the active slot until execution settles and persists cancellation across restart', async () => {
+it('serializes admission and keeps cancellation active until the model drains', async () => {
   const blocked = gate();
   const f = await setup(new ScriptedModel([blocked.response]));
-  const running = f.post('input', { text: 'blocked' }).then((result) => result);
+  const running = f.input('blocked').then((response) => response);
   await blocked.entered;
-  expect((await f.query()).json().active).toBe(true);
-  for (const action of ['input', 'continue'])
-    expect(
-      (
-        await f.post(
-          action,
-          action === 'input' ? { text: 'racing' } : undefined,
-        )
-      ).statusCode,
-    ).toBe(409);
-  const canceled = await f.post('cancel');
-  expect(canceled.statusCode).toBe(200);
-  expect(canceled.json()).toMatchObject({
+  expect((await f.input('racing')).statusCode).toBe(409);
+  expect((await f.next()).statusCode).toBe(409);
+  const canceled = (await f.cancel()).json();
+  expect(canceled).toMatchObject({
     active: true,
     closedAt: expect.any(String),
   });
-  expect((await f.query()).json()).toMatchObject({
+  blocked.release();
+  await running;
+  expect((await f.cancel()).json()).toMatchObject({
+    active: false,
+    closedAt: canceled.closedAt,
+  });
+  expect((await f.input('closed')).statusCode).toBe(409);
+});
+
+it('stops and drains the current run when its HTTP client disconnects', async () => {
+  const blocked = gate();
+  const f = await setup(new ScriptedModel([blocked.response]));
+  const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const controller = new AbortController();
+  try {
+    const response = await fetch(
+      `${address}${f.path}/runs?modelConfigId=${f.modelConfigId}`,
+      {
+        method: 'POST',
+        headers: { ...f.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'disconnect' }],
+        }),
+        signal: controller.signal,
+      },
+    );
+    expect(response.status).toBe(200);
+    await blocked.entered;
+    controller.abort();
+    await blocked.aborted;
+    expect((await f.metadata()).json()).toMatchObject({
+      active: true,
+      closedAt: null,
+    });
+    blocked.release();
+    await vi.waitFor(async () =>
+      expect((await f.metadata()).json().active).toBe(false),
+    );
+    expect((await f.query()).json().next.length).toBeGreaterThan(0);
+  } finally {
+    controller.abort();
+    blocked.release();
+  }
+});
+
+it('stops on timeout without closing and waits for underlying work', async () => {
+  const blocked = gate();
+  const f = await setup(
+    new ScriptedModel([blocked.response, new AIMessage('continued')]),
+    { AGENT_TIMEOUT_MS: '1000' },
+  );
+  const running = f.input('timeout').then((response) => response);
+  await blocked.entered;
+  await new Promise<void>((resolve) => setTimeout(resolve, 1050));
+  expect((await f.metadata()).json()).toMatchObject({
     active: true,
-    canSubmit: false,
-    canContinue: false,
+    closedAt: null,
   });
   blocked.release();
-  expect((await running).body).toContain('"status":"stopped"');
-  expect((await f.post('cancel')).json().closedAt).toBe(
-    canceled.json().closedAt,
-  );
-  await f.app.close();
+  await running;
+  expect((await f.query()).json().next.length).toBeGreaterThan(0);
+  expect((await f.next()).body).toContain('continued');
+});
+
+it('drains active execution on service shutdown', async () => {
+  const blocked = gate();
+  const f = await setup(new ScriptedModel([blocked.response]));
+  const running = f.input('shutdown').then((response) => response);
+  await blocked.entered;
+  const stopping = f.app.close();
+  blocked.release();
+  await Promise.all([running, stopping]);
   const model = new ScriptedModel([]);
   const app = createApp(createDatabase(url!), f.config, model);
   apps.push(app);
   expect(
-    (await app.inject({ url: f.path, headers: f.headers })).json(),
-  ).toMatchObject({ active: false, closedAt: canceled.json().closedAt });
-  for (const action of ['input', 'continue'])
-    expect(
-      (
-        await app.inject({
-          method: 'POST',
-          url: `${f.path}/${action}`,
-          headers: f.headers,
-          ...(action === 'input'
-            ? { payload: { text: 'closed', modelConfigId: f.modelConfigId } }
-            : {}),
-        })
-      ).statusCode,
-    ).toBe(409);
+    (await app.inject({ url: f.path, headers: f.headers })).json().next.length,
+  ).toBeGreaterThan(0);
   expect(model.seen).toHaveLength(0);
 });
 
-it('times out without closing the conversation and resets the timer on continuation', async () => {
-  const first = gate();
-  const second = gate();
-  const f = await setup(new ScriptedModel([first.response, second.response]), {
-    AGENT_TIMEOUT_MS: '1000',
-  });
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  const running = f.post('input', { text: 'timeout' }).then((result) => result);
-  await first.entered;
-  await vi.advanceTimersByTimeAsync(1000);
-  expect((await f.query()).json().active).toBe(true);
-  first.release();
-  expect((await running).body).toContain('"status":"stopped"');
-  expect((await f.query()).json()).toMatchObject({
-    active: false,
-    closedAt: null,
-    canContinue: true,
-  });
-  const resumed = f.post('continue').then((result) => result);
-  await second.entered;
-  await vi.advanceTimersByTimeAsync(999);
-  second.release();
-  expect((await resumed).body).toContain('event: completed');
-});
-
-it('disconnects cooperatively, keeps the slot and leaves saved work available', async () => {
-  const blocked = gate();
-  const f = await setup(
-    new ScriptedModel([blocked.response, new AIMessage('continued')]),
-  );
-  const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
-  const controller = new AbortController();
-  const pending = fetch(`${address}${f.path}/input`, {
-    method: 'POST',
-    headers: { ...f.headers, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      text: 'disconnect',
-      modelConfigId: f.modelConfigId,
-    }),
-    signal: controller.signal,
-  }).catch(() => undefined);
-  await blocked.entered;
-  controller.abort();
-  await pending;
-  // Query round trip lets the socket close event be handled without a timing sleep.
-  expect((await f.query()).json()).toMatchObject({
-    closedAt: null,
-    active: true,
-  });
-  expect((await f.post('input', { text: 'too soon' })).statusCode).toBe(409);
-  blocked.release();
-  await vi.waitFor(async () =>
-    expect((await f.query()).json().active).toBe(false),
-  );
-  expect((await f.query()).json().canContinue).toBe(true);
-  expect((await f.post('continue')).body).toContain('continued');
-});
-
-it('shutdown stops active work without closing or automatically restarting the conversation', async () => {
-  const blocked = gate();
-  const f = await setup(new ScriptedModel([blocked.response]));
-  const running = f
-    .post('input', { text: 'shutdown' })
-    .then((result) => result);
-  await blocked.entered;
-  const closing = f.app.close();
-  blocked.release();
-  await running;
-  await closing;
-  const model = new ScriptedModel([]);
-  const app = createApp(createDatabase(url!), f.config, model);
-  apps.push(app);
-  const state = (await app.inject({ url: f.path, headers: f.headers })).json();
-  expect(state).toMatchObject({
-    active: false,
-    closedAt: null,
-    canContinue: true,
-  });
-  expect(model.seen).toHaveLength(0);
-});
-
-it('owns transport setup and keeps the slot through terminal output and shutdown', async () => {
-  const model = new ScriptedModel([new AIMessage('answer')]);
-  const f = await setup(model);
-  const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: userA };
-  const setupError = new Error('response setup failed');
-  await expect(
-    execution.execute(
-      f.id,
-      identity,
-      { text: 'not started', modelConfigId: f.modelConfigId! },
-      async () => {
-        throw setupError;
-      },
-    ),
-  ).rejects.toBe(setupError);
-  expect(model.seen).toHaveLength(0);
-  expect(await execution.query(f.id, identity)).toMatchObject({
-    active: false,
-    canSubmit: true,
-  });
-
-  const ending = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  releases.push(release.resolve);
-  const running = execution.execute(
-    f.id,
-    identity,
-    { text: 'started', modelConfigId: f.modelConfigId! },
-    (call) =>
-      call.stream(async (event) => {
-        if (event === 'end') {
-          ending.resolve();
-          await release.promise;
-        }
-      }),
-  );
-  await ending.promise;
-  expect(await execution.query(f.id, identity)).toMatchObject({ active: true });
-  await expect(
-    execution.execute(
-      f.id,
-      identity,
-      { text: 'racing', modelConfigId: f.modelConfigId! },
-      async () => {},
-    ),
-  ).rejects.toThrow('Execution active');
-  let stopped = false;
-  const stopping = execution.stop().then(() => (stopped = true));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  expect(stopped).toBe(false);
-  release.resolve();
-  await running;
-  await stopping;
-  expect((await execution.query(f.id, identity)).active).toBe(false);
-});
-
-it('aborts a live model before closing the graph iterator when output fails', async () => {
-  let finished = false;
-  let abortedBeforeModelFinished = false;
-  let signal: AbortSignal;
-  class StreamingModel extends ScriptedModel {
-    override async *_streamResponseChunks(
-      messages: BaseMessage[],
-      options: BaseChatModelCallOptions,
-      runManager?: CallbackManagerForLLMRun,
-    ) {
-      try {
-        for await (const chunk of super._streamResponseChunks(
-          messages,
-          options,
-        )) {
-          yield chunk;
-          await runManager?.handleLLMNewToken(
-            chunk.text,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            { chunk },
-          );
-        }
-        await new Promise<void>((resolve) => {
-          const signal = options.signal!;
-          if (signal.aborted) resolve();
-          else
-            signal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      } finally {
-        abortedBeforeModelFinished = signal.aborted;
-        finished = true;
-      }
-    }
-  }
-  const model = new StreamingModel([new AIMessage('first chunk')]);
-  const f = await setup(model);
-  const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: userA };
-  const writeError = new Error('response write failed');
-  let abort = () => {};
-  const running = execution.execute(
-    f.id,
-    identity,
-    { text: 'streaming', modelConfigId: f.modelConfigId! },
-    (call) => {
-      signal = call.signal;
-      abort = () => call.abort();
-      return call.stream(async () => {
-        throw writeError;
-      });
-    },
-  );
-  const rejected = expect(running).rejects.toBe(writeError);
-  try {
-    await vi.waitFor(() => expect(finished).toBe(true));
-    expect(abortedBeforeModelFinished).toBe(true);
-    await rejected;
-    expect((await execution.query(f.id, identity)).active).toBe(false);
-  } finally {
-    abort();
-    await rejected;
-  }
-});
-
-it('waits for in-flight admission during shutdown and never starts its agent', async () => {
+it('waits for admission while stopping and does not launch the model', async () => {
   const model = new ScriptedModel([]);
   const f = await setup(model);
   const execution = createExecution(f.database, f.config, model);
-  const identity = { userId: userA };
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   releases.push(release.resolve);
   const getTuple = f.database.saver.getTuple.bind(f.database.saver);
-  const read = vi
-    .spyOn(f.database.saver, 'getTuple')
-    .mockImplementationOnce(async (config) => {
+  vi.spyOn(f.database.saver, 'getTuple').mockImplementationOnce(
+    async (config) => {
       entered.resolve();
       await release.promise;
       return getTuple(config);
-    });
-  const consume = vi.fn(async () => {});
+    },
+  );
   const running = execution.execute(
     f.id,
-    identity,
-    { text: 'admitting', modelConfigId: f.modelConfigId! },
-    consume,
+    { userId: userA },
+    { messages: [{ role: 'user', content: 'admission' }] },
+    f.modelConfigId,
+    async () => {},
   );
   const rejected = expect(running).rejects.toThrow('Server stopping');
-  try {
-    await entered.promise;
-    let stopped = false;
-    const stopping = execution.stop().then(() => (stopped = true));
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(stopped).toBe(false);
-    await expect(
-      execution.execute(
-        f.id,
-        identity,
-        { text: 'too late', modelConfigId: f.modelConfigId! },
-        consume,
-      ),
-    ).rejects.toThrow('Server stopping');
-    release.resolve();
-    await rejected;
-    await stopping;
-    expect(consume).not.toHaveBeenCalled();
-    expect(model.seen).toHaveLength(0);
-  } finally {
-    release.resolve();
-    await rejected;
-    read.mockRestore();
-  }
+  await entered.promise;
+  const stopping = execution.stop();
+  release.resolve();
+  await rejected;
+  await stopping;
+  expect(model.seen).toHaveLength(0);
 });
 
-it('persists pending approvals, blocks bypasses and resumes with fresh limits after restart', async () => {
-  const text = `${'visible '.repeat(30)}private-tail`;
-  const model = new ScriptedModel([callTool('echo', { text })]);
-  const f = await setup(model, {
-    AGENT_MODEL_CALL_LIMIT: '1',
-    AGENT_TOOL_CALL_LIMIT: '1',
-    AGENT_TIMEOUT_MS: '1000',
-  });
-  const response = await f.post('input', { text: 'approval' });
-  expect(response.body).toContain('event: awaiting_approval');
-  expect(response.body).not.toContain('"status":"finished"');
-  expect(response.body).not.toContain('private-tail');
-  expect(model.seen).toHaveLength(1);
-  const pending = (await f.query()).json();
-  expect(pending).toMatchObject({
-    awaitingApproval: true,
-    canSubmit: false,
-    canContinue: false,
-    canApprove: true,
-    active: false,
-    closedAt: null,
-    approvalAudit: [],
-    approvals: [
-      {
-        interruptId: expect.any(String),
-        decisionStatus: 'pending',
-        actions: [
-          {
-            toolName: 'echo',
-            argumentSummary: text.slice(0, 200),
-            allowedDecisions: ['approve', 'reject'],
-          },
-        ],
-      },
-    ],
-  });
-  const decision = {
-    interruptId: pending.approvals[0].interruptId,
-    decisions: [{ type: 'approve' }],
-  };
-  expect(response.body).toContain(decision.interruptId);
-  for (const action of ['input', 'continue'])
-    expect(
-      (
-        await f.post(
-          action,
-          action === 'input' ? { text: 'bypass' } : undefined,
-        )
-      ).json().error,
-    ).toBe('Approval required');
-  expect(
-    (await f.post('approvals', { ...decision, interruptId: 'stale' }))
-      .statusCode,
-  ).toBe(409);
-  expect(
-    (
-      await f.post('approvals', {
-        ...decision,
-        decisions: [{ type: 'approve' }, { type: 'reject' }],
-      })
-    ).statusCode,
-  ).toBe(400);
-  expect(await f.database.db.select().from(approvalAudits)).toEqual([]);
-
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  await vi.advanceTimersByTimeAsync(10000);
-  expect((await f.query()).json()).toMatchObject({
-    active: false,
-    closedAt: null,
-    canApprove: true,
-  });
-  vi.useRealTimers();
-  await f.app.close();
-  const resumedModel = new ScriptedModel([new AIMessage('approved answer')]);
-  const database = createDatabase(url!);
-  const app = createApp(database, f.config, resumedModel);
-  apps.push(app);
-  expect(
-    (await app.inject({ url: f.path, headers: f.headers })).json().approvals,
-  ).toEqual(pending.approvals);
-  expect(resumedModel.seen).toHaveLength(0);
-  const approve = (payload = decision) =>
-    app.inject({
-      method: 'POST',
-      url: `${f.path}/approvals`,
-      headers: f.headers,
-      payload,
-    });
-  const resumed = await approve();
-  expect(resumed.headers['content-type']).toContain('text/event-stream');
-  expect(resumed.body).toContain('approved answer');
-  expect(resumed.body).toContain('"status":"finished"');
-  expect(resumed.body).toContain('event: completed');
-  expect(resumed.body).toContain('"status":"completed"');
-  expect(resumedModel.seen).toHaveLength(1);
-  expect(
-    resumedModel.seen[0].filter(isToolMessage).map((message) => message.text),
-  ).toEqual([text]);
-  for (const type of ['approve', 'reject'])
-    expect(
-      (await approve({ ...decision, decisions: [{ type }] })).statusCode,
-    ).toBe(409);
-  const saved = (await app.inject({ url: f.path, headers: f.headers })).json();
-  expect(saved).toMatchObject({
-    approvals: [],
-    awaitingApproval: false,
-    canApprove: false,
-    active: false,
-    canSubmit: true,
-    approvalAudit: [
-      {
-        interruptId: decision.interruptId,
-        decisions: decision.decisions,
-        userId: userA,
-        createdAt: expect.any(String),
-      },
-    ],
-  });
-  expect(await database.db.select().from(approvalAudits)).toHaveLength(1);
-});
-
-it('matches batched decisions by position and requires a new approval for a rejected tool request', async () => {
+it('passes full native approval payloads and tool outputs and resumes with Command input', async () => {
+  const text = `  ${'visible '.repeat(30)}complete-tail\n\n`;
   const model = new ScriptedModel([
-    new AIMessage({
-      content: '',
-      tool_calls: [
-        {
-          name: 'echo',
-          args: { text: 'approved-text' },
-          id: 'approved-call',
-          type: 'tool_call',
-        },
-        {
-          name: 'echo',
-          args: { text: 'rejected-text' },
-          id: 'rejected-call',
-          type: 'tool_call',
-        },
-      ],
-    }),
-    callTool('echo', { text: 'rejected-text' }, 'new-call'),
-    new AIMessage('rejection acknowledged'),
+    callTool('echo', { text, extraArgument: 'model argument' }),
+    new AIMessage('approved'),
   ]);
   const f = await setup(model);
-  await f.post('input', { text: 'batch' });
-  const first = (await f.query()).json().approvals[0];
-  expect(first.actions).toHaveLength(2);
-  const resumed = await f.post('approvals', {
-    interruptId: first.interruptId,
-    decisions: [{ type: 'approve' }, { type: 'reject' }],
+  const waiting = await f.input('approval');
+  expect(waiting.body).toContain('extraArgument');
+  expect(waiting.body).toContain('complete-tail');
+  expect(waiting.body).not.toContain('input.requested');
+  const pending = (await f.query()).json().tasks[0].interrupts[0];
+  expect(pending.value.actionRequests[0]).toMatchObject({
+    name: 'echo',
+    args: { text, extraArgument: 'model argument' },
+    description: expect.stringContaining('complete-tail'),
   });
-  expect(resumed.body).toContain('event: awaiting_approval');
-  const toolResults = model.seen[1].filter(isToolMessage);
-  expect(toolResults).toHaveLength(2);
-  expect(
-    toolResults.find((message) => message.tool_call_id === 'approved-call')
-      ?.text,
-  ).toBe('approved-text');
-  expect(
-    toolResults.find((message) => message.tool_call_id === 'rejected-call'),
-  ).toMatchObject({ status: 'error' });
-  const next = (await f.query()).json().approvals[0];
-  expect(next.interruptId).not.toBe(first.interruptId);
-  expect(next.decisionStatus).toBe('pending');
-  expect((await f.post('continue')).statusCode).toBe(409);
-  const rejected = await f.post('approvals', {
-    interruptId: next.interruptId,
-    decisions: [{ type: 'reject' }],
-  });
-  expect(rejected.body).toContain('rejection acknowledged');
-  expect(rejected.body).toContain('event: completed');
-  expect(
-    model.seen[2]
-      .filter(isToolMessage)
-      .find((message) => message.tool_call_id === 'new-call'),
-  ).toMatchObject({ status: 'error' });
-  expect((await f.query()).json().approvalAudit).toHaveLength(2);
+  expect(pending.value.reviewConfigs[0].allowedDecisions).toEqual([
+    'approve',
+    'edit',
+    'reject',
+    'respond',
+  ]);
+  expect((await f.input('bypass')).statusCode).toBe(409);
+  expect((await f.next()).statusCode).toBe(409);
+  expect((await f.resume(pending.id, [])).statusCode).toBe(400);
+  const resumed = await f.resume(pending.id, [{ type: 'approve' }]);
+  expect(resumed.body).toContain('tool-finished');
+  expect(resumed.body).toContain('complete-tail');
+  expect(resumed.body).not.toContain('input.answered');
+  expect(model.seen[1].filter(ToolMessage.isInstance)[0].content).toBe(text);
+  expect((await f.metadata()).json().approvalAudit).toMatchObject([
+    {
+      interruptId: pending.id,
+      decisions: [{ type: 'approve' }],
+      userId: userA,
+    },
+  ]);
 });
 
-it('never resumes without an audit receipt or resends a recorded decision whose outcome is unconfirmed', async () => {
-  const model = new ScriptedModel([callTool('echo', { text: 'not executed' })]);
+it('restores native batched interrupts and preserves all four decisions across restart', async () => {
+  const text = '  approval\n';
+  const decisions: Decision[] = [
+    { type: 'approve' },
+    {
+      type: 'edit',
+      editedAction: { name: 'echo', args: { text: '  edited\ttext\n' } },
+    },
+    { type: 'reject', message: '  do not run this call\n' },
+    { type: 'respond', message: '  human result\n' },
+  ];
+  const f = await setup(
+    new ScriptedModel([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'one', name: 'echo', args: { text }, type: 'tool_call' },
+          {
+            id: 'two',
+            name: 'echo',
+            args: { text: 'edit me' },
+            type: 'tool_call',
+          },
+          {
+            id: 'three',
+            name: 'echo',
+            args: { text: 'reject me' },
+            type: 'tool_call',
+          },
+          {
+            id: 'four',
+            name: 'echo',
+            args: { text: 'answer for me' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ]),
+  );
+  await f.input('batch');
+  const pending = (await f.query()).json().tasks[0].interrupts[0];
+  expect((await f.resume(pending.id, decisions.slice(0, 3))).statusCode).toBe(
+    400,
+  );
+  expect((await f.metadata()).json().approvalAudit).toEqual([]);
+  await f.app.close();
+  const model = new ScriptedModel([new AIMessage('reviewed')]);
+  const app = createApp(createDatabase(url!), f.config, model);
+  apps.push(app);
+  const reply = await app.inject({
+    method: 'POST',
+    url: `${f.path}/runs`,
+    headers: f.headers,
+    payload: resumeInput({ interruptId: pending.id, decisions }),
+  });
+  expect(reply.statusCode).toBe(200);
+  expect(reply.body).toContain('reviewed');
+  expect(reply.body.match(/"event":"tool-started"/g)).toHaveLength(2);
+  const results = model.seen[0].filter(ToolMessage.isInstance);
+  expect(results).toHaveLength(4);
+  expect(
+    results.find((message) => message.tool_call_id === 'one')?.content,
+  ).toBe(text);
+  expect(
+    results.find((message) => message.tool_call_id === 'two')?.content,
+  ).toBe('  edited\ttext\n');
+  expect(
+    results.find((message) => message.tool_call_id === 'three'),
+  ).toMatchObject({ content: '  do not run this call\n', status: 'error' });
+  expect(
+    results.find((message) => message.tool_call_id === 'four'),
+  ).toMatchObject({ content: '  human result\n', status: 'success' });
+  await app.close();
+  const restarted = createApp(
+    createDatabase(url!),
+    f.config,
+    new ScriptedModel([]),
+  );
+  apps.push(restarted);
+  expect(
+    (
+      await restarted.inject({ url: `${f.path}/metadata`, headers: f.headers })
+    ).json().approvalAudit,
+  ).toMatchObject([{ interruptId: pending.id, decisions, userId: userA }]);
+  expect(
+    (await restarted.inject({ url: f.path, headers: f.headers })).json().next,
+  ).toEqual([]);
+});
+
+it('executes edited arguments using the native decision and records the complete edit', async () => {
+  const model = new ScriptedModel([
+    callTool('echo', { text: 42 }),
+    new AIMessage('edited'),
+  ]);
   const f = await setup(model);
-  await f.post('input', { text: 'approval' });
-  const { interruptId } = (await f.query()).json().approvals[0];
-  const decision = { interruptId, decisions: [{ type: 'approve' as const }] };
+  await f.input('correct the tool arguments');
+  const pending = (await f.query()).json().tasks[0].interrupts[0];
+  expect(pending.value.actionRequests[0].args).toEqual({ text: 42 });
+  const decisions: Decision[] = [
+    {
+      type: 'edit',
+      editedAction: { name: 'echo', args: { text: '  corrected\ttext\n' } },
+    },
+  ];
+  const reply = await f.resume(pending.id, decisions);
+  expect(reply.statusCode).toBe(200);
+  expect(reply.body).toContain('tool-started');
+  expect(model.seen[1].filter(ToolMessage.isInstance)[0].content).toBe(
+    '  corrected\ttext\n',
+  );
+  expect((await f.metadata()).json().approvalAudit[0].decisions).toEqual(
+    decisions,
+  );
+});
+
+it('returns a human response without executing the tool and records the complete response', async () => {
+  const model = new ScriptedModel([
+    callTool('echo', { text: 'tool output' }),
+    new AIMessage('answered'),
+  ]);
+  const f = await setup(model);
+  await f.input('answer for the tool');
+  const pending = (await f.query()).json().tasks[0].interrupts[0];
+  const decisions: Decision[] = [
+    { type: 'respond', message: '  human answer\t\n' },
+  ];
+  const reply = await f.resume(pending.id, decisions);
+  expect(reply.statusCode).toBe(200);
+  expect(reply.body).not.toContain('tool-started');
+  expect(model.seen[1].filter(ToolMessage.isInstance)[0]).toMatchObject({
+    content: '  human answer\t\n',
+    status: 'success',
+  });
+  expect((await f.metadata()).json().approvalAudit[0].decisions).toEqual(
+    decisions,
+  );
+});
+
+it('requires an audit and refuses to resend any recorded decision', async () => {
+  const model = new ScriptedModel([callTool('echo', { text: 'review' })]);
+  const f = await setup(model);
+  await f.input('approval');
+  const pending = (await f.query()).json().tasks[0].interrupts[0];
   const insert = vi
     .spyOn(f.database.db, 'insert')
     .mockImplementationOnce(() => {
-      throw new Error('private-audit-error');
+      throw new Error('audit error');
     });
-  const failed = await f.post('approvals', decision);
+  const decisions: Decision[] = [
+    {
+      type: 'edit',
+      editedAction: { name: 'echo', args: { text: 'edited result' } },
+    },
+  ];
+  expect((await f.resume(pending.id, decisions)).statusCode).toBe(500);
   insert.mockRestore();
-  expect(failed.statusCode).toBe(500);
-  expect(failed.body).not.toContain('private-audit-error');
-  expect((await f.query()).json().canApprove).toBe(true);
-  expect(await f.database.db.select().from(approvalAudits)).toEqual([]);
-  const execution = createExecution(f.database, f.config, model);
-  await expect(
-    execution.execute(f.id, { userId: userA }, decision, async () => {
-      throw new Error('response setup failed after receipt');
-    }),
-  ).rejects.toThrow('response setup failed after receipt');
+  const getTuple = f.database.saver.getTuple.bind(f.database.saver);
+  const read = vi
+    .spyOn(f.database.saver, 'getTuple')
+    .mockImplementationOnce(getTuple)
+    .mockRejectedValueOnce(new Error('resume error'));
+  await f.resume(pending.id, decisions);
+  read.mockRestore();
   expect(model.seen).toHaveLength(1);
-  expect((await f.query()).json()).toMatchObject({
-    active: false,
-    awaitingApproval: true,
-    canApprove: false,
-    approvals: [{ interruptId, decisionStatus: 'unconfirmed' }],
-    approvalAudit: [{ interruptId, decisions: decision.decisions }],
-  });
-  // The unique key is the durable guard even across processes.
-  await expect(
-    f.database.db
-      .insert(approvalAudits)
-      .values({ conversationId: f.id, ...decision, userId: userA }),
-  ).rejects.toThrow();
-  // A later model configuration change cannot turn a recorded decision into a retry.
+  expect((await f.metadata()).json().approvalAudit).toMatchObject([
+    { decisions },
+  ]);
+  expect((await f.query()).json().tasks[0].interrupts[0].id).toBe(pending.id);
   await f.database.db.update(modelConfigs).set({ enabled: false });
-  await f.app.close();
-  const unused = new ScriptedModel([]);
-  const app = createApp(createDatabase(url!), f.config, unused);
-  apps.push(app);
-  for (const type of ['approve', 'reject']) {
-    const repeated = await app.inject({
-      method: 'POST',
-      url: `${f.path}/approvals`,
-      headers: f.headers,
-      payload: { interruptId, decisions: [{ type }] },
-    });
-    expect(repeated.statusCode).toBe(409);
-    expect(repeated.json().error).toBe('Decision outcome unconfirmed');
-  }
-  expect(
-    (await app.inject({ url: f.path, headers: f.headers })).json().approvals[0]
-      .decisionStatus,
-  ).toBe('unconfirmed');
-  expect(unused.seen).toHaveLength(0);
-  await app.inject({
-    method: 'POST',
-    url: `${f.path}/cancel`,
-    headers: f.headers,
-  });
   expect(
     (
-      await app.inject({
-        method: 'POST',
-        url: `${f.path}/approvals`,
-        headers: f.headers,
-        payload: decision,
-      })
+      await f.resume(pending.id, [
+        { type: 'respond', message: 'different decision' },
+      ])
     ).json().error,
-  ).toBe('Conversation closed');
+  ).toBe('Decision outcome unconfirmed');
 });
 
 it.each([true, false])(
-  'serializes approval with cancellation when approval goes first: %s',
-  async (approvalFirst) => {
-    const blocked = gate();
+  'serializes approval and cancellation when approval starts first: %s',
+  async (first) => {
     const model = new ScriptedModel([
-      callTool('echo', { text: 'review me' }),
-      blocked.response,
+      callTool('echo', { text: 'review' }),
+      new AIMessage('done'),
     ]);
     const f = await setup(model);
-    await f.post('input', { text: 'approval race' });
-    const { interruptId } = (await f.query()).json().approvals[0];
-    const decision = { interruptId, decisions: [{ type: 'approve' }] };
+    await f.input('race');
+    const pending = (await f.query()).json().tasks[0].interrupts[0];
     const execution = createExecution(f.database, f.config, model);
     const identity = { userId: userA };
-    const events: string[] = [];
     const approve = () =>
       execution
         .execute(
           f.id,
           identity,
-          {
-            interruptId,
-            decisions: [{ type: 'approve' }],
+          new Command({
+            resume: { [pending.id]: { decisions: [{ type: 'approve' }] } },
+          }),
+          undefined,
+          async (run) => {
+            for await (const event of run) void event;
           },
-          (call) =>
-            call.stream(async (event, data) => {
-              events.push(`${event}:${JSON.stringify(data)}`);
-            }),
         )
         .then(
           () => 'accepted',
           (error: Error) => error.message,
         );
-    // Both operations queue synchronously on the same lock before either DB read finishes.
-    const first = approvalFirst ? approve() : execution.cancel(f.id, identity);
-    const second = approvalFirst ? execution.cancel(f.id, identity) : approve();
-    const canceled = await (approvalFirst ? second : first);
-    expect(canceled).toMatchObject({
-      closedAt: expect.any(Date),
-      active: approvalFirst,
-    });
-    for (const action of ['input', 'continue', 'approvals'])
-      expect(
-        (
-          await f.post(
-            action,
-            action === 'input'
-              ? { text: 'closed' }
-              : action === 'approvals'
-                ? decision
-                : undefined,
-          )
-        ).statusCode,
-      ).toBe(409);
-    blocked.release();
-    const approval = await (approvalFirst ? first : second);
-    expect(approval).toBe(approvalFirst ? 'accepted' : 'Conversation closed');
-    if (approvalFirst) expect(events.join()).toContain('"status":"stopped"');
-    expect(await execution.query(f.id, identity)).toMatchObject({
-      closedAt: expect.any(Date),
-      active: false,
-      canApprove: false,
-    });
+    const a = first ? approve() : execution.cancel(f.id, identity);
+    const b = first ? execution.cancel(f.id, identity) : approve();
+    expect(await (first ? b : a)).toMatchObject({ closedAt: expect.any(Date) });
+    await (first ? a : b);
+    await execution.stop();
     expect(await f.database.db.select().from(approvalAudits)).toHaveLength(
-      approvalFirst ? 1 : 0,
+      first ? 1 : 0,
     );
-    expect(model.seen.length).toBeLessThanOrEqual(approvalFirst ? 2 : 1);
   },
 );
 
-it('requires available model configuration even with an injected client', async () => {
-  const model = new ScriptedModel([]);
-  const f = await setup(model);
-  const [selected] = await f.database.db.select().from(modelConfigs);
-  await f.database.db.update(modelConfigs).set({ enabled: false });
-  expect(
-    (
-      await f.post('input', {
-        text: 'disabled model',
-        modelConfigId: selected.id,
-      })
-    ).statusCode,
-  ).toBe(404);
-  expect(model.seen).toHaveLength(0);
-  expect((await f.query()).json().lastExecutionModelConfigId).toBeNull();
-});
-
-it('refuses execution without model configuration and disables provider request retries', async () => {
-  const unconfigured = await setup(undefined);
-  expect((await unconfigured.post('input', { text: 'hello' })).statusCode).toBe(
-    400,
-  );
-  const key = 'ab'.repeat(32);
-  const f = await setup(undefined, { MODEL_CREDENTIALS_KEY: key });
-  const provider = await createProvider(
-    f.database,
-    {
-      name: 'test',
-      type: 'openai',
-      apiKey: 'test-only-key',
-    },
-    key,
-  );
-  const selected = await createModel(f.database, {
-    providerId: provider.providerId,
-    modelName: 'gpt-4.1-mini',
-  });
-  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
-    async () =>
-      new Response(
-        JSON.stringify({
-          error: {
-            message: 'private-provider-error',
-            type: 'rate_limit_error',
-          },
-        }),
-        { status: 429, headers: { 'content-type': 'application/json' } },
-      ),
-  );
-  try {
-    const response = await f.post('input', {
-      text: 'no retries',
-      modelConfigId: selected.modelConfigId,
-    });
-    expect(response.body).toContain('event: error');
-    expect(response.body).not.toContain('private-provider-error');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  } finally {
-    fetchMock.mockRestore();
-  }
-});
-
-it('does not signal cancellation when persisting the close marker fails', async () => {
+it('cancels and drains a native run when its consumer fails', async () => {
   const blocked = gate();
   const f = await setup(new ScriptedModel([blocked.response]));
-  const running = f
-    .post('input', { text: 'close failure' })
-    .then((result) => result);
-  await blocked.entered;
-  const update = vi
-    .spyOn(f.database.db, 'update')
-    .mockImplementationOnce(() => {
-      throw new Error('private-db-error');
-    });
-  expect((await f.post('cancel')).statusCode).toBe(500);
-  update.mockRestore();
-  expect((await f.query()).json()).toMatchObject({
-    active: true,
-    closedAt: null,
-  });
+  const execution = createExecution(
+    f.database,
+    f.config,
+    new ScriptedModel([blocked.response]),
+  );
+  const running = execution.execute(
+    f.id,
+    { userId: userA },
+    { messages: [{ role: 'user', content: 'consumer' }] },
+    f.modelConfigId,
+    async () => {
+      await blocked.entered;
+      throw new Error('writer failed');
+    },
+  );
+  const rejected = expect(running).rejects.toThrow('writer failed');
+  await blocked.aborted;
+  expect((await execution.metadata(f.id, { userId: userA })).active).toBe(true);
   blocked.release();
-  expect((await running).body).toContain('event: completed');
-});
-
-it('serializes simultaneous admission, continuation and cancellation without a second call', async () => {
-  const blocked = gate();
-  const model = new ScriptedModel([blocked.response]);
-  const f = await setup(model);
-  const entering = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  releases.push(release.resolve);
-  const getTuple = f.database.saver.getTuple.bind(f.database.saver);
-  const read = vi
-    .spyOn(f.database.saver, 'getTuple')
-    .mockImplementationOnce(async (config) => {
-      entering.resolve();
-      await release.promise;
-      return getTuple(config);
-    });
-  const first = f.post('input', { text: 'first' }).then((result) => result);
-  await entering.promise;
-  const second = f.post('input', { text: 'second' }).then((result) => result);
-  const continuation = f.post('continue').then((result) => result);
-  const cancel = f.post('cancel').then((result) => result);
-  release.resolve();
-  expect((await second).statusCode).toBe(409);
-  expect((await continuation).statusCode).toBe(409);
-  expect((await cancel).statusCode).toBe(200);
-  blocked.release();
-  await first;
-  read.mockRestore();
-  expect(model.seen.length).toBeLessThanOrEqual(1);
-  expect((await f.query()).json()).toMatchObject({
-    active: false,
-    closedAt: expect.any(String),
-  });
-});
-
-it('does not treat old state as proof of an input whose checkpoint was never saved', async () => {
-  const model = new ScriptedModel([new AIMessage('old answer')]);
-  const f = await setup(model);
-  await f.post('input', { text: 'old input' });
-  const put = vi
-    .spyOn(f.database.saver, 'put')
-    .mockRejectedValueOnce(new Error('interrupted before input persisted'));
-  const failed = await f.post('input', { text: 'unsaved input' });
-  expect(failed.body).toContain('event: error');
-  put.mockRestore();
-  await f.app.close();
-  const db = createDatabase(url!);
-  const unused = new ScriptedModel([]);
-  const app = createApp(db, f.config, unused);
-  apps.push(app);
-  const saved = (await app.inject({ url: f.path, headers: f.headers })).json();
-  expect(saved.messages.at(-1).content).toBe('old answer');
-  expect(saved.messages).not.toContainEqual({
-    role: 'user',
-    content: 'unsaved input',
-  });
-  expect(unused.seen).toHaveLength(0);
-  expect(model.seen).toHaveLength(1);
+  await rejected;
+  expect((await execution.metadata(f.id, { userId: userA })).active).toBe(
+    false,
+  );
+  await execution.stop();
 });

@@ -12,7 +12,7 @@ import {
   modelProviders,
 } from '../src/database/schema.js';
 import { jwtFixture, prepareUsers, userA, userB } from './auth-helpers.js';
-import { ScriptedModel } from './helpers.js';
+import { ScriptedModel, startInput, resumeInput } from './helpers.js';
 
 const url = process.env.TEST_DATABASE_URL;
 if (!url)
@@ -177,13 +177,13 @@ it('switches A → B → A within one chat, preserves tool history and keeps cha
   const post = (payload: Record<string, unknown>) =>
     f.app.inject({
       method: 'POST',
-      url: `${f.path}/input`,
+      url: `${f.path}/runs`,
       headers: f.headers,
-      payload,
+      ...startInput(payload),
     });
   expect(
     (await post({ text: 'first', modelConfigId: f.modelA })).body,
-  ).toContain('event: awaiting_approval');
+  ).toContain('__interrupt__');
   const pending = (
     await f.app.inject({ url: f.path, headers: f.headers })
   ).json();
@@ -191,15 +191,15 @@ it('switches A → B → A within one chat, preserves tool history and keeps cha
     (
       await f.app.inject({
         method: 'POST',
-        url: `${f.path}/approvals`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: {
-          interruptId: pending.approvals[0].interruptId,
+        payload: resumeInput({
+          interruptId: pending.tasks[0].interrupts[0].id,
           decisions: [{ type: 'approve' }],
-        },
+        }),
       })
     ).body,
-  ).toContain('event: completed');
+  ).toContain('"event":"completed"');
   expect(
     (await post({ text: 'second', modelConfigId: f.modelB })).body,
   ).toContain('model-b answer');
@@ -220,21 +220,19 @@ it('switches A → B → A within one chat, preserves tool history and keeps cha
   expect(
     calls[2].body.messages.some((message) => message.role === 'tool'),
   ).toBe(true);
-  expect(
-    calls[3].body.messages.some(
-      (message) => message.content === 'model-b answer',
-    ),
-  ).toBe(true);
+  expect(calls[3].body.messages).toContainEqual({
+    role: 'assistant',
+    content: [{ type: 'text', text: 'model-b answer' }],
+  });
   const state = (
     await f.app.inject({ url: f.path, headers: f.headers })
   ).json();
   expect(state).not.toHaveProperty('defaultModelConfigId');
   expect(state).not.toHaveProperty('defaultModel');
-  expect(state.lastExecutionModelConfigId).toBe(f.modelA);
-  expect(state.lastExecutionModel).toEqual({
-    id: f.modelA,
-    modelName: 'codex-a',
-  });
+  const metadata = (
+    await f.app.inject({ url: `${f.path}/metadata`, headers: f.headers })
+  ).json();
+  expect(metadata.lastExecutionModelConfigId).toBe(f.modelA);
   expect(JSON.stringify(state)).not.toContain('private-key');
   const created = await f.app.inject({
     method: 'POST',
@@ -244,9 +242,9 @@ it('switches A → B → A within one chat, preserves tool history and keeps cha
   const otherPath = `/conversations/${created.json().conversationId}`;
   await f.app.inject({
     method: 'POST',
-    url: `${otherPath}/input`,
+    url: `${otherPath}/runs`,
     headers: f.headers,
-    payload: { text: 'separate', modelConfigId: f.modelB },
+    ...startInput({ text: 'separate', modelConfigId: f.modelB }),
   });
   expect(calls.at(-1)!.body.model).toBe('model-b');
   expect(
@@ -266,20 +264,23 @@ it('persists the selected model across restart and rejects override on continuat
   const calls = providerMock(['error', 'text']);
   const failed = await f.app.inject({
     method: 'POST',
-    url: `${f.path}/input`,
+    url: `${f.path}/runs`,
     headers: f.headers,
-    payload: { text: 'resume this', modelConfigId: f.modelB },
+    ...startInput({ text: 'resume this', modelConfigId: f.modelB }),
   });
-  expect(failed.body).toContain('event: error');
-  expect(failed.body).not.toContain('private-provider-error');
+  expect(failed.body).toContain('"event":"failed"');
+  expect(failed.body).toContain('private-provider-error');
   expect(calls).toHaveLength(1);
   expect(
     (
       await f.app.inject({
         method: 'POST',
-        url: `${f.path}/input`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: { text: 'cannot bypass', modelConfigId: f.modelA },
+        ...startInput({
+          text: 'cannot bypass',
+          modelConfigId: f.modelA,
+        }),
       })
     ).statusCode,
   ).toBe(409);
@@ -296,16 +297,17 @@ it('persists the selected model across restart and rejects override on continuat
     (
       await app.inject({
         method: 'POST',
-        url: `${f.path}/continue`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: { modelConfigId: f.modelA },
+        query: { modelConfigId: f.modelA },
       })
     ).statusCode,
   ).toBe(400);
   const resumed = await app.inject({
     method: 'POST',
-    url: `${f.path}/continue`,
+    url: `${f.path}/runs`,
     headers: f.headers,
+    payload: undefined,
   });
   expect(resumed.body).toContain('gpt-4o answer');
   expect(calls.map((call) => call.body.model)).toEqual(['model-b', 'gpt-4o']);
@@ -373,9 +375,12 @@ it('shares model selection globally while isolating paginated chats by owner', a
     (
       await f.app.inject({
         method: 'POST',
-        url: `/conversations/${other.json().conversationId}/input`,
+        url: `/conversations/${other.json().conversationId}/runs`,
         headers: otherHeaders,
-        payload: { text: 'explicit selection', modelConfigId: f.modelA },
+        ...startInput({
+          text: 'explicit selection',
+          modelConfigId: f.modelA,
+        }),
       })
     ).statusCode,
   ).toBe(200);
@@ -422,21 +427,21 @@ it('rotates credentials, rejects disabled selections without fallback, and permi
     (
       await f.app.inject({
         method: 'POST',
-        url: `${f.path}/input`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: { text: 'rotated', modelConfigId: f.modelA },
+        ...startInput({ text: 'rotated', modelConfigId: f.modelA }),
       })
     ).body,
-  ).toContain('event: completed');
+  ).toContain('"event":"completed"');
   expect(calls[0].authorization).toBe('Bearer rotated-private-key');
   await f.request('PATCH', `/models/${f.modelB}`, {
     enabled: false,
   });
   const disabled = await f.app.inject({
     method: 'POST',
-    url: `${f.path}/input`,
+    url: `${f.path}/runs`,
     headers: f.headers,
-    payload: { text: 'no fallback', modelConfigId: f.modelB },
+    ...startInput({ text: 'no fallback', modelConfigId: f.modelB }),
   });
   expect(disabled.statusCode).toBe(404);
   expect(calls).toHaveLength(1);
@@ -450,9 +455,9 @@ it('rotates credentials, rejects disabled selections without fallback, and permi
     (
       await readOnly.inject({
         method: 'POST',
-        url: `${f.path}/input`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: { text: 'missing key', modelConfigId: f.modelA },
+        ...startInput({ text: 'missing key', modelConfigId: f.modelA }),
       })
     ).statusCode,
   ).toBe(503);
@@ -463,9 +468,12 @@ it('rotates credentials, rejects disabled selections without fallback, and permi
     (
       await f.app.inject({
         method: 'POST',
-        url: `${f.path}/input`,
+        url: `${f.path}/runs`,
         headers: f.headers,
-        payload: { text: 'disabled provider', modelConfigId: f.modelA },
+        ...startInput({
+          text: 'disabled provider',
+          modelConfigId: f.modelA,
+        }),
       })
     ).statusCode,
   ).toBe(404);
@@ -620,9 +628,9 @@ it('keeps every in-flight model call fixed while provider routing and model conf
   const running = f.app
     .inject({
       method: 'POST',
-      url: `${f.path}/input`,
+      url: `${f.path}/runs`,
       headers: f.headers,
-      payload: { text: 'in flight', modelConfigId: f.modelA },
+      ...startInput({ text: 'in flight', modelConfigId: f.modelA }),
     })
     .then((response) => response);
   try {
@@ -639,16 +647,16 @@ it('keeps every in-flight model call fixed while provider routing and model conf
       (
         await f.app.inject({
           method: 'POST',
-          url: `${f.path}/input`,
+          url: `${f.path}/runs`,
           headers: f.headers,
-          payload: { text: 'racing', modelConfigId: f.modelB },
+          ...startInput({ text: 'racing', modelConfigId: f.modelB }),
         })
       ).statusCode,
     ).toBe(409);
-    const state = (
-      await f.app.inject({ url: f.path, headers: f.headers })
+    const metadata = (
+      await f.app.inject({ url: `${f.path}/metadata`, headers: f.headers })
     ).json();
-    expect(state).toMatchObject({
+    expect(metadata).toMatchObject({
       active: true,
       lastExecutionModelConfigId: f.modelA,
     });
@@ -664,9 +672,9 @@ it('keeps every in-flight model call fixed while provider routing and model conf
   }
   await f.app.inject({
     method: 'POST',
-    url: `${f.path}/input`,
+    url: `${f.path}/runs`,
     headers: f.headers,
-    payload: { text: 'next', modelConfigId: f.modelA },
+    ...startInput({ text: 'next', modelConfigId: f.modelA }),
   });
   expect(calls[2].body.model).toBe('gpt-4o');
   expect(calls[2].url).toContain('new.models.example');
@@ -678,30 +686,36 @@ it('continues work started with an injected model using the configured client af
   const f = await setup(model);
   const failed = await f.app.inject({
     method: 'POST',
-    url: `${f.path}/input`,
+    url: `${f.path}/runs`,
     headers: f.headers,
-    payload: { text: 'resume injected work', modelConfigId: f.modelA },
+    ...startInput({
+      text: 'resume injected work',
+      modelConfigId: f.modelA,
+    }),
   });
-  expect(failed.body).toContain('event: error');
+  expect(failed.body).toContain('"event":"failed"');
   expect(model.seen).toHaveLength(1);
   const state = (
     await f.app.inject({ url: f.path, headers: f.headers })
   ).json();
-  expect(state).toMatchObject({
-    lastExecutionModelConfigId: f.modelA,
-    canContinue: true,
-  });
+  expect(state.next.length).toBeGreaterThan(0);
+  expect(
+    (
+      await f.app.inject({ url: `${f.path}/metadata`, headers: f.headers })
+    ).json().lastExecutionModelConfigId,
+  ).toBe(f.modelA);
   await f.app.close();
   const app = createApp(createDatabase(url!), f.config);
   apps.push(app);
   const calls = providerMock();
   const resumed = await app.inject({
     method: 'POST',
-    url: `${f.path}/continue`,
+    url: `${f.path}/runs`,
     headers: f.headers,
+    payload: undefined,
   });
   expect(resumed.statusCode).toBe(200);
-  expect(resumed.body).toContain('event: completed');
+  expect(resumed.body).toContain('"event":"completed"');
   expect(calls).toHaveLength(1);
   expect(calls[0].body.model).toBe('codex-a');
   expect(calls[0].body.messages).toContainEqual({
@@ -948,9 +962,12 @@ it('lists disabled models and allows creation under a disabled provider', async 
   });
   const unavailable = await f.app.inject({
     method: 'POST',
-    url: f.path + '/input',
+    url: f.path + '/runs',
     headers: f.headers,
-    payload: { text: 'unavailable', modelConfigId: created.modelConfigId },
+    ...startInput({
+      text: 'unavailable',
+      modelConfigId: created.modelConfigId,
+    }),
   });
   expect(unavailable.statusCode).toBe(404);
   const noKey = createApp(createDatabase(url!), {
@@ -1000,9 +1017,9 @@ it('rejects provider credential substitution before any model request and accept
     .where(eq(modelProviders.id, f.providerA));
   const rejected = await f.app.inject({
     method: 'POST',
-    url: f.path + '/input',
+    url: f.path + '/runs',
     headers: f.headers,
-    payload: { text: 'invalid binding', modelConfigId: f.modelA },
+    ...startInput({ text: 'invalid binding', modelConfigId: f.modelA }),
   });
   expect(rejected.statusCode).toBe(503);
   expect(rejected.body).not.toContain(other.encrypted);
@@ -1013,11 +1030,11 @@ it('rejects provider credential substitution before any model request and accept
   });
   const accepted = await f.app.inject({
     method: 'POST',
-    url: f.path + '/input',
+    url: f.path + '/runs',
     headers: f.headers,
-    payload: { text: 'valid binding', modelConfigId: f.modelA },
+    ...startInput({ text: 'valid binding', modelConfigId: f.modelA }),
   });
-  expect(accepted.body).toContain('event: completed');
+  expect(accepted.body).toContain('"event":"completed"');
   expect(calls[0].authorization).toBe('Bearer new-private-key');
 });
 
@@ -1031,15 +1048,15 @@ it('does not start a model if persisting its recovery selection fails', async ()
     });
   const response = await f.app.inject({
     method: 'POST',
-    url: `${f.path}/input`,
+    url: `${f.path}/runs`,
     headers: f.headers,
-    payload: { text: 'not admitted', modelConfigId: f.modelA },
+    ...startInput({ text: 'not admitted', modelConfigId: f.modelA }),
   });
   update.mockRestore();
   expect(response.statusCode).toBe(500);
   expect(response.body).not.toContain('private-write-error');
   expect(calls).toHaveLength(0);
   expect(
-    (await f.app.inject({ url: f.path, headers: f.headers })).json().messages,
-  ).toEqual([]);
+    (await f.app.inject({ url: f.path, headers: f.headers })).json().values,
+  ).toEqual({});
 });
